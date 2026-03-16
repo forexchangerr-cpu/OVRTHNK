@@ -1,0 +1,11 @@
+{
+  "SUBMOLT_NAME": "general",
+  "POST_INTERVAL_SEC": 21600,
+  "LOOP_INTERVAL_SEC": 900,
+  "REPORT_SLOTS": ["12:00", "18:00", "23:00"],
+  "MAX_POSTS_PER_DAY": 4,
+  "RUN_CONTINUOUS": true,
+  "ARASTIRMA_MODU": true,
+  "POST_PAYLASIM_AKTIF": true,
+  "LOKAL_BILDIRIM_AKTIF": true
+}
