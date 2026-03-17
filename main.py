@@ -62,6 +62,7 @@ TRADE_EXECUTION_MODE = os.getenv("TRADE_EXECUTION_MODE", "confirm")  # auto|conf
 MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0.5"))
 DAILY_MAX_LOSS_PCT = float(os.getenv("DAILY_MAX_LOSS_PCT", "2.0"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "3"))
 LIVE_ORDER_EXECUTION = os.getenv("LIVE_ORDER_EXECUTION", "0").lower() in ("1", "true", "yes")
 OTONOM_TRADE_AKTIF = os.getenv("OTONOM_TRADE_AKTIF", "1").lower() in ("1", "true", "yes")
 TRADE_ANALIZ_INTERVAL_MIN = int(os.getenv("TRADE_ANALIZ_INTERVAL_MIN", "60"))
@@ -179,7 +180,7 @@ def stabil_profili_uygula():
     global MAX_POSTS_PER_DAY, RUN_CONTINUOUS, ARASTIRMA_MODU, POST_PAYLASIM_AKTIF, LOKAL_BILDIRIM_AKTIF
     global TRADE_DENEYIM_PAYLASIM_AKTIF, TRADE_DENEYIM_SLOT, MT5_AKTIF
     global MT5_BRIDGE_AKTIF, MT5_BRIDGE_PYTHON, MT5_FILE_BRIDGE_DIR, LIVE_ORDER_EXECUTION
-    global TRADE_EXECUTION_MODE, MAX_RISK_PER_TRADE_PCT, DAILY_MAX_LOSS_PCT, MAX_OPEN_TRADES
+    global TRADE_EXECUTION_MODE, MAX_RISK_PER_TRADE_PCT, DAILY_MAX_LOSS_PCT, MAX_OPEN_TRADES, MAX_DAILY_TRADES
     global OTONOM_TRADE_AKTIF, TRADE_ANALIZ_INTERVAL_MIN
 
     if not STABLE_MODE:
@@ -216,6 +217,7 @@ def stabil_profili_uygula():
     MAX_RISK_PER_TRADE_PCT = float(profil.get("MAX_RISK_PER_TRADE_PCT", MAX_RISK_PER_TRADE_PCT))
     DAILY_MAX_LOSS_PCT = float(profil.get("DAILY_MAX_LOSS_PCT", DAILY_MAX_LOSS_PCT))
     MAX_OPEN_TRADES = int(profil.get("MAX_OPEN_TRADES", MAX_OPEN_TRADES))
+    MAX_DAILY_TRADES = int(profil.get("MAX_DAILY_TRADES", MAX_DAILY_TRADES))
     OTONOM_TRADE_AKTIF = _to_bool(profil.get("OTONOM_TRADE_AKTIF", OTONOM_TRADE_AKTIF), OTONOM_TRADE_AKTIF)
     TRADE_ANALIZ_INTERVAL_MIN = int(profil.get("TRADE_ANALIZ_INTERVAL_MIN", TRADE_ANALIZ_INTERVAL_MIN))
 
@@ -1631,6 +1633,11 @@ def otonom_trade_karari(hesap: dict, gunluk_durum: dict) -> list:
         logger.info(f"🛑 Günlük max kayıp ({gunluk_kayip_pct:.1f}% >= {DAILY_MAX_LOSS_PCT}%). Bugün işlem yok.")
         return []
 
+    acilan_islem_sayisi = int(gunluk_durum.get("acilan_islem_sayisi") or 0)
+    if acilan_islem_sayisi >= MAX_DAILY_TRADES:
+        logger.info(f"🛑 Günlük işlem limiti dolu ({acilan_islem_sayisi}/{MAX_DAILY_TRADES}). Yeni işlem açılmıyor.")
+        return []
+
     queue_data = trade_queue_yukle()
     aktif = aktif_order_sayisi(queue_data)
     if aktif >= MAX_OPEN_TRADES:
@@ -1805,7 +1812,13 @@ def otonom_trade_dongusu():
     else:
         ai_firsat_yok_serisi += 1
 
-    if not kararlar and ai_firsat_yok_serisi >= 3 and aktif == 0 and gunluk_kayip_pct < (DAILY_MAX_LOSS_PCT * 0.5):
+    if (
+        not kararlar
+        and ai_firsat_yok_serisi >= 3
+        and aktif == 0
+        and gunluk_kayip_pct < (DAILY_MAX_LOSS_PCT * 0.5)
+        and int(gunluk_durum.get("acilan_islem_sayisi") or 0) < MAX_DAILY_TRADES
+    ):
         sym = sembol_bilgisi_al("XAUUSD")
         if sym and sym.get("bid", 0) > 0 and sym.get("ask", 0) > 0:
             bid = sym.get("bid", 0)
