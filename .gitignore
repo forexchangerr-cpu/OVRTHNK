@@ -10,6 +10,8 @@ gunluk_rapor.txt
 haftalik_saglik_raporu.txt
 rapor_arsiv/
 learned_memory.json
+moltbook_insights.json
+learned_memory.backup.*.json
 post_history.json
 report_state.json
 trade_journal.json

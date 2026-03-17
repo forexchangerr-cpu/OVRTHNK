@@ -99,6 +99,9 @@ MT5_BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), "mt5_bridge.py")
 MT5_OUTBOX_FILE = os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_orders_outbox.csv")
 MT5_RESULT_FILE = os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_orders_result.csv")
 GUNLUK_DURUM_DOSYASI = os.path.join(os.path.dirname(__file__), "gunluk_trade_durum.json")
+MOLTBOOK_INSIGHT_FILE = os.path.join(os.path.dirname(__file__), "moltbook_insights.json")
+MOLTBOOK_INSIGHT_MIN_POST = int(os.getenv("MOLTBOOK_INSIGHT_MIN_POST", "50"))
+MOLTBOOK_INSIGHT_MAX_ITEMS = int(os.getenv("MOLTBOOK_INSIGHT_MAX_ITEMS", "400"))
 
 # --- YARDIMCI FONKSİYONLAR (MEVCUT) ---
 def safe_request(method, url, max_attempts=3, backoff=2, **kwargs):
@@ -234,12 +237,18 @@ def stabil_profili_uygula():
 LEARNED_MEMORY = load_json(MEMORY_FILE, {})
 POST_HISTORY = load_json(HISTORY_FILE, [])
 RAPOR_DURUMU = load_json(RAPOR_DURUM_DOSYASI, {"sent_slots": []})
+MOLTBOOK_INSIGHTS = load_json(MOLTBOOK_INSIGHT_FILE, {"seen_post_ids": [], "items": []})
 stabil_profili_uygula()
 
 if "weekly_slots" not in RAPOR_DURUMU:
     RAPOR_DURUMU["weekly_slots"] = []
 if "trade_experience_slots" not in RAPOR_DURUMU:
     RAPOR_DURUMU["trade_experience_slots"] = []
+
+if not isinstance(MOLTBOOK_INSIGHTS.get("seen_post_ids"), list):
+    MOLTBOOK_INSIGHTS["seen_post_ids"] = []
+if not isinstance(MOLTBOOK_INSIGHTS.get("items"), list):
+    MOLTBOOK_INSIGHTS["items"] = []
 
 MT5_CONNECTED = False
 MT5_BACKEND = "none"
@@ -876,7 +885,7 @@ def uygun_icerik_uret(soru_tipi: str, gelen_yorum=None, max_deneme: int = 2):
     son_neden = []
     icerik_tipi = "yorum" if soru_tipi == "Yorumu Cevapla" else "post"
 
-    deneme_sayisi = 4 if soru_tipi == "Yeni Post Oluştur" else max_deneme
+    deneme_sayisi = 4 if soru_tipi in {"Yeni Post Oluştur", "Moltbook Gözlem Özeti"} else max_deneme
     for _ in range(deneme_sayisi):
         aday = ajana_sor(soru_tipi, gelen_yorum=gelen_yorum)
         aday = metin_temizle(aday)
@@ -942,7 +951,7 @@ def ajana_sor(soru_tipi, gelen_yorum=None):
         arastirma_notu = f"\n\nGüncel Veriler:\n{internette_arastir(karar.replace('ARASTIR:', '').strip())}"
 
     prompt = f"{KARAKTER}{arastirma_notu}\n\nGörev: {soru_tipi}"
-    if gelen_yorum:
+    if soru_tipi == "Yorumu Cevapla" and gelen_yorum:
         uzunluk_profili = yorum_uzunlugu_profili(gelen_yorum)
         yorum_kurali = (
             "Buna 3-5 cümleyle, biraz daha derin ama sade bir yorum yaz."
@@ -952,6 +961,14 @@ def ajana_sor(soru_tipi, gelen_yorum=None):
         prompt += (
             f"\n\nİçerik: '{gelen_yorum}'. {yorum_kurali} "
             "Hitap cümlesi kurma, ukalalık yapma, çengel soru zorlaması yapma."
+        )
+    elif soru_tipi == "Moltbook Gözlem Özeti" and gelen_yorum:
+        prompt += (
+            "\n\nAşağıdaki Moltbook akış gözlemlerini sentezleyerek tek bir post üret. "
+            "Maksimum 5 kısa madde halinde yaz. Finansal fırsat/risk dengesi ver. "
+            "Kesinlikle selamlama, slogan, 'dijital meslektaşlarım', 'algoritmik dostlarım', 'Başlık:' kullanma. "
+            "Gözlem dışı uydurma iddia yapma.\n\n"
+            f"Gözlemler:\n{gelen_yorum}"
         )
     else:
         prompt += (
@@ -1437,9 +1454,52 @@ def yorum_dogrula(verification: dict, headers: dict):
         logger.warning(f"Yorum doğrulama hatası: {e}")
 
 
+def moltbook_gozlem_kaydet(post: dict):
+    try:
+        post_id = str(post.get("id") or "").strip()
+        if not post_id:
+            return
+
+        seen = MOLTBOOK_INSIGHTS.get("seen_post_ids", [])
+        if post_id in seen:
+            return
+
+        author = post.get("author", {}).get("username") or "bilinmiyor"
+        title = (post.get("title") or "").strip()
+        content = (post.get("content") or "").replace("\n", " ").strip()
+        merged = f"{title} {content}".strip()
+
+        item = {
+            "id": post_id,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "author": author,
+            "text": merged[:700],
+        }
+
+        items = MOLTBOOK_INSIGHTS.get("items", [])
+        items.append(item)
+        MOLTBOOK_INSIGHTS["items"] = items[-MOLTBOOK_INSIGHT_MAX_ITEMS:]
+        MOLTBOOK_INSIGHTS["seen_post_ids"] = (seen + [post_id])[-5000:]
+        save_json(MOLTBOOK_INSIGHT_FILE, MOLTBOOK_INSIGHTS)
+    except Exception as e:
+        logger.warning(f"Moltbook gözlem kaydı hatası: {e}")
+
+
+def moltbook_gozlem_ozet_kaynagi(limit: int = 50):
+    items = MOLTBOOK_INSIGHTS.get("items", [])
+    if len(items) < limit:
+        return None
+
+    secilen = items[-limit:]
+    satirlar = []
+    for row in secilen:
+        satirlar.append(f"- @{row.get('author', 'bilinmiyor')}: {(row.get('text') or '')[:280]}")
+    return "\n".join(satirlar)
+
+
 def diger_postlari_tara_ve_etkiles():
     logger.info("🤝 Diğer postları tarayıp etkileşime giriyorum...")
-    url = f"https://www.moltbook.com/api/v1/posts?submolt_name={SUBMOLT_NAME}&limit=5"
+    url = f"https://www.moltbook.com/api/v1/posts?submolt_name={SUBMOLT_NAME}&limit=20"
     headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
     res = safe_request("get", url, headers=headers)
     if res.status_code != 200:
@@ -1447,9 +1507,15 @@ def diger_postlari_tara_ve_etkiles():
         return
 
     posts = res.json().get("posts", [])
+    yeni_gozlem = 0
     for post in posts:
         if post.get("author", {}).get("username") == "ovrthnk_agent":
             continue
+
+        onceki = len(MOLTBOOK_INSIGHTS.get("items", []))
+        moltbook_gozlem_kaydet(post)
+        if len(MOLTBOOK_INSIGHTS.get("items", [])) > onceki:
+            yeni_gozlem += 1
 
         yorum_kaynagi = post.get("content", "")[:600]
         cevap, puan, nedenler = uygun_icerik_uret("Yorumu Cevapla", gelen_yorum=yorum_kaynagi)
@@ -1468,6 +1534,11 @@ def diger_postlari_tara_ve_etkiles():
             logger.warning(f"Yorum başarısız: {yorum_res.status_code} {yorum_res.text[:200]}")
         time.sleep(5)
 
+    logger.info(
+        f"📚 Moltbook gözlem havuzu: {len(MOLTBOOK_INSIGHTS.get('items', []))} kayıt "
+        f"(+{yeni_gozlem} yeni, post için hedef {MOLTBOOK_INSIGHT_MIN_POST})"
+    )
+
 
 def paylas_ve_takil():
     if not POST_PAYLASIM_AKTIF:
@@ -1485,8 +1556,17 @@ def paylas_ve_takil():
         logger.info("Günlük post limiti doldu.")
         return
 
+    gozlem_kaynagi = moltbook_gozlem_ozet_kaynagi(MOLTBOOK_INSIGHT_MIN_POST)
+    if not gozlem_kaynagi:
+        mevcut = len(MOLTBOOK_INSIGHTS.get("items", []))
+        logger.info(
+            f"🧠 Özet post beklemede: gözlem {mevcut}/{MOLTBOOK_INSIGHT_MIN_POST}. "
+            "Yeterli veri birikmeden yeni post atılmıyor."
+        )
+        return
+
     logger.info("🕒 Post zamanı geldi, içerik hazırlanıyor...")
-    yeni_post, puan, nedenler = uygun_icerik_uret("Yeni Post Oluştur")
+    yeni_post, puan, nedenler = uygun_icerik_uret("Moltbook Gözlem Özeti", gelen_yorum=gozlem_kaynagi)
     if puan < 88:
         logger.info(f"⛔ Post atlanıyor (uygunluk puanı {puan}/100): {', '.join(nedenler) if nedenler else 'düşük kalite'}")
         return
