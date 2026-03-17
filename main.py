@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import smtplib
+import ast
 import subprocess
 import sys
 import time
@@ -100,8 +101,10 @@ MT5_OUTBOX_FILE = os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_orders_outbox.csv")
 MT5_RESULT_FILE = os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_orders_result.csv")
 GUNLUK_DURUM_DOSYASI = os.path.join(os.path.dirname(__file__), "gunluk_trade_durum.json")
 MOLTBOOK_INSIGHT_FILE = os.path.join(os.path.dirname(__file__), "moltbook_insights.json")
+MOLTBOOK_COMMENT_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "moltbook_comment_history.json")
 MOLTBOOK_INSIGHT_MIN_POST = int(os.getenv("MOLTBOOK_INSIGHT_MIN_POST", "50"))
 MOLTBOOK_INSIGHT_MAX_ITEMS = int(os.getenv("MOLTBOOK_INSIGHT_MAX_ITEMS", "400"))
+MAX_COMMENTS_PER_HOUR = int(os.getenv("MAX_COMMENTS_PER_HOUR", "12"))
 
 # --- YARDIMCI FONKSİYONLAR (MEVCUT) ---
 def safe_request(method, url, max_attempts=3, backoff=2, **kwargs):
@@ -238,6 +241,7 @@ LEARNED_MEMORY = load_json(MEMORY_FILE, {})
 POST_HISTORY = load_json(HISTORY_FILE, [])
 RAPOR_DURUMU = load_json(RAPOR_DURUM_DOSYASI, {"sent_slots": []})
 MOLTBOOK_INSIGHTS = load_json(MOLTBOOK_INSIGHT_FILE, {"seen_post_ids": [], "items": []})
+MOLTBOOK_COMMENT_HISTORY = load_json(MOLTBOOK_COMMENT_HISTORY_FILE, {"commented_post_ids": []})
 stabil_profili_uygula()
 
 if "weekly_slots" not in RAPOR_DURUMU:
@@ -249,6 +253,12 @@ if not isinstance(MOLTBOOK_INSIGHTS.get("seen_post_ids"), list):
     MOLTBOOK_INSIGHTS["seen_post_ids"] = []
 if not isinstance(MOLTBOOK_INSIGHTS.get("items"), list):
     MOLTBOOK_INSIGHTS["items"] = []
+if not isinstance(MOLTBOOK_COMMENT_HISTORY.get("commented_post_ids"), list):
+    MOLTBOOK_COMMENT_HISTORY["commented_post_ids"] = []
+if not isinstance(MOLTBOOK_COMMENT_HISTORY.get("comment_timestamps"), list):
+    MOLTBOOK_COMMENT_HISTORY["comment_timestamps"] = []
+if not isinstance(MOLTBOOK_COMMENT_HISTORY.get("pause_until_ts"), (int, float)):
+    MOLTBOOK_COMMENT_HISTORY["pause_until_ts"] = 0
 
 MT5_CONNECTED = False
 MT5_BACKEND = "none"
@@ -1425,6 +1435,87 @@ def zamanli_rapor_kontrolu_ve_gonderimi():
     logger.info(f"🕒 Rapor slotu tamamlandı: {slot_id}")
 
 
+def _safe_math_eval(expr: str):
+    izinli = {
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult,
+        ast.Div, ast.USub, ast.UAdd, ast.Constant, ast.Load,
+    }
+    node = ast.parse(expr, mode="eval")
+    for child in ast.walk(node):
+        if type(child) not in izinli:
+            raise ValueError("unsupported expression")
+    return eval(compile(node, "<math>", "eval"), {"__builtins__": {}}, {})
+
+
+def matematik_sorusu_coz(challenge: str):
+    metin = (challenge or "").strip()
+    if not metin:
+        return None
+
+    expr = metin.replace("×", "*").replace("x", "*").replace("X", "*").replace("÷", "/")
+    expr = expr.replace(",", ".")
+    expr = re.sub(r"[^0-9\+\-\*\/\(\)\.]", " ", expr)
+    expr = re.sub(r"\s+", "", expr)
+    if not expr:
+        return None
+
+    try:
+        sonuc = float(_safe_math_eval(expr))
+        return f"{sonuc:.2f}"
+    except Exception:
+        return None
+
+
+def yorum_gecmisi_var_mi(post_id: str):
+    return post_id in set(MOLTBOOK_COMMENT_HISTORY.get("commented_post_ids", []))
+
+
+def yorum_gecmisi_kaydet(post_id: str):
+    ids = MOLTBOOK_COMMENT_HISTORY.get("commented_post_ids", [])
+    if post_id in ids:
+        return
+    MOLTBOOK_COMMENT_HISTORY["commented_post_ids"] = (ids + [post_id])[-5000:]
+    save_json(MOLTBOOK_COMMENT_HISTORY_FILE, MOLTBOOK_COMMENT_HISTORY)
+
+
+def yorum_kota_bakimi():
+    now = time.time()
+    stamps = [float(ts) for ts in MOLTBOOK_COMMENT_HISTORY.get("comment_timestamps", []) if now - float(ts) <= 86400]
+    MOLTBOOK_COMMENT_HISTORY["comment_timestamps"] = stamps
+    if float(MOLTBOOK_COMMENT_HISTORY.get("pause_until_ts", 0)) < now:
+        MOLTBOOK_COMMENT_HISTORY["pause_until_ts"] = 0
+    save_json(MOLTBOOK_COMMENT_HISTORY_FILE, MOLTBOOK_COMMENT_HISTORY)
+
+
+def son_bir_saat_yorum_sayisi():
+    now = time.time()
+    return len([ts for ts in MOLTBOOK_COMMENT_HISTORY.get("comment_timestamps", []) if now - float(ts) <= 3600])
+
+
+def yorum_yapabilir_mi():
+    yorum_kota_bakimi()
+    now = time.time()
+    pause_until = float(MOLTBOOK_COMMENT_HISTORY.get("pause_until_ts", 0))
+    if pause_until > now:
+        return False, f"server cooldown aktif ({int((pause_until - now) // 60)} dk kaldı)"
+    saatlik = son_bir_saat_yorum_sayisi()
+    if saatlik >= MAX_COMMENTS_PER_HOUR:
+        return False, f"yerel saatlik yorum limiti dolu ({saatlik}/{MAX_COMMENTS_PER_HOUR})"
+    return True, "ok"
+
+
+def yorum_kota_kaydet():
+    stamps = MOLTBOOK_COMMENT_HISTORY.get("comment_timestamps", [])
+    stamps.append(time.time())
+    MOLTBOOK_COMMENT_HISTORY["comment_timestamps"] = stamps[-1000:]
+    save_json(MOLTBOOK_COMMENT_HISTORY_FILE, MOLTBOOK_COMMENT_HISTORY)
+
+
+def yorum_cooldown_uygula(seconds: int):
+    MOLTBOOK_COMMENT_HISTORY["pause_until_ts"] = max(float(MOLTBOOK_COMMENT_HISTORY.get("pause_until_ts", 0)), time.time() + max(60, seconds))
+    save_json(MOLTBOOK_COMMENT_HISTORY_FILE, MOLTBOOK_COMMENT_HISTORY)
+
+
 def yorum_dogrula(verification: dict, headers: dict):
     """Moltbook'un yorum sonrası gönderdiği matematik doğrulama sorusunu çöz ve gönder."""
     try:
@@ -1432,14 +1523,16 @@ def yorum_dogrula(verification: dict, headers: dict):
         challenge = verification.get("challenge_text", "")
         if not code or not challenge:
             return
-        cevap = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Matematik problemini çöz. SADECE sayıyı yaz, 2 ondalık basamakla. (örnek: '46.00')"},
-                {"role": "user", "content": challenge},
-            ],
-            max_tokens=20,
-        ).choices[0].message.content.strip()
+        cevap = matematik_sorusu_coz(challenge)
+        if not cevap:
+            cevap = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "Matematik problemini çöz. SADECE sayıyı yaz, 2 ondalık basamakla. (örnek: '46.00')"},
+                    {"role": "user", "content": challenge},
+                ],
+                max_tokens=20,
+            ).choices[0].message.content.strip()
         res = safe_request(
             "post",
             "https://www.moltbook.com/api/v1/verify",
@@ -1499,6 +1592,11 @@ def moltbook_gozlem_ozet_kaynagi(limit: int = 50):
 
 def diger_postlari_tara_ve_etkiles():
     logger.info("🤝 Diğer postları tarayıp etkileşime giriyorum...")
+    yorum_ok, yorum_neden = yorum_yapabilir_mi()
+    if not yorum_ok:
+        logger.info(f"🛑 Yorum turu atlandı: {yorum_neden}")
+        return
+
     url = f"https://www.moltbook.com/api/v1/posts?submolt_name={SUBMOLT_NAME}&limit=20"
     headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
     res = safe_request("get", url, headers=headers)
@@ -1508,8 +1606,14 @@ def diger_postlari_tara_ve_etkiles():
 
     posts = res.json().get("posts", [])
     yeni_gozlem = 0
+    basarili_yorum = 0
     for post in posts:
+        post_id = str(post.get("id") or "").strip()
         if post.get("author", {}).get("username") == "ovrthnk_agent":
+            continue
+        if not post_id:
+            continue
+        if yorum_gecmisi_var_mi(post_id):
             continue
 
         onceki = len(MOLTBOOK_INSIGHTS.get("items", []))
@@ -1522,16 +1626,31 @@ def diger_postlari_tara_ve_etkiles():
         if puan < 75:
             logger.info(f"⛔ Yorum atlanıyor (uygunluk puanı {puan}/100): {', '.join(nedenler) if nedenler else 'düşük kalite'}")
             continue
-        comment_url = f"https://www.moltbook.com/api/v1/posts/{post.get('id')}/comments"
+        comment_url = f"https://www.moltbook.com/api/v1/posts/{post_id}/comments"
         yorum_res = yorum_gonder_with_retry(comment_url, headers, cevap)
         if yorum_res.status_code in (200, 201):
-            logger.info(f"💬 Yorum bırakıldı: {post.get('id')} (puan {puan}/100)")
+            logger.info(f"💬 Yorum bırakıldı: {post_id} (puan {puan}/100)")
+            yorum_gecmisi_kaydet(post_id)
+            yorum_kota_kaydet()
+            basarili_yorum += 1
             data = yorum_res.json()
             verification = data.get("comment", {}).get("verification") or data.get("verification")
             if verification:
                 yorum_dogrula(verification, headers)
         else:
             logger.warning(f"Yorum başarısız: {yorum_res.status_code} {yorum_res.text[:200]}")
+            if yorum_res.status_code == 429:
+                try:
+                    body = yorum_res.json()
+                except Exception:
+                    body = {}
+                retry_after = int(body.get("retry_after_seconds") or 3600)
+                yorum_cooldown_uygula(retry_after)
+                logger.info(f"🛑 Moltbook yorum cooldown aktif: {retry_after} sn")
+                break
+        if basarili_yorum >= 2:
+            logger.info("🧩 Bu tur yorum kotası doldu (2 yorum).")
+            break
         time.sleep(5)
 
     logger.info(

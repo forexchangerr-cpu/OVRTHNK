@@ -11,6 +11,7 @@ haftalik_saglik_raporu.txt
 rapor_arsiv/
 learned_memory.json
 moltbook_insights.json
+moltbook_comment_history.json
 learned_memory.backup.*.json
 post_history.json
 report_state.json
