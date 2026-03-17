@@ -6,12 +6,21 @@ import smtplib
 import subprocess
 import sys
 import time
+import uuid
+import csv
+import random
 from datetime import datetime
 from email.message import EmailMessage
 from dotenv import load_dotenv
 from openai import OpenAI
 import requests
 from tavily import TavilyClient
+try:
+    import MetaTrader5 as mt5
+    MT5_IMPORT_ERROR = ""
+except Exception as e:
+    mt5 = None
+    MT5_IMPORT_ERROR = str(e)
 
 load_dotenv()
 
@@ -37,6 +46,25 @@ SUBMOLT_NAME = os.getenv("SUBMOLT_NAME", "general")
 POST_INTERVAL_SEC = 21600  # Sabit 6 saat (Kendi postumuz için)
 LOOP_INTERVAL_SEC = 900    # 15 dakika (Yorum ve araştırma turu için)
 REPORT_SLOTS = ["12:00", "18:00", "23:00"]
+WEEKLY_HEALTH_DAY = int(os.getenv("WEEKLY_HEALTH_DAY", "0"))  # 0=Pazartesi ... 6=Pazar
+WEEKLY_HEALTH_TIME = os.getenv("WEEKLY_HEALTH_TIME", "21:00")
+TRADE_DENEYIM_PAYLASIM_AKTIF = os.getenv("TRADE_DENEYIM_PAYLASIM_AKTIF", "1").lower() in ("1", "true", "yes")
+TRADE_DENEYIM_SLOT = os.getenv("TRADE_DENEYIM_SLOT", "23:00")
+MT5_AKTIF = os.getenv("MT5_AKTIF", "1").lower() in ("1", "true", "yes")
+MT5_LOGIN = os.getenv("MT5_LOGIN", "").strip()
+MT5_PASSWORD = os.getenv("MT5_PASSWORD", "").strip()
+MT5_SERVER = os.getenv("MT5_SERVER", "").strip()
+MT5_PATH = os.getenv("MT5_PATH", "").strip()
+MT5_BRIDGE_AKTIF = os.getenv("MT5_BRIDGE_AKTIF", "1").lower() in ("1", "true", "yes")
+MT5_BRIDGE_PYTHON = os.getenv("MT5_BRIDGE_PYTHON", "python3.11").strip()
+MT5_FILE_BRIDGE_DIR = os.getenv("MT5_FILE_BRIDGE_DIR", "").strip() or os.path.dirname(__file__)
+TRADE_EXECUTION_MODE = os.getenv("TRADE_EXECUTION_MODE", "confirm")  # auto|confirm|manual
+MAX_RISK_PER_TRADE_PCT = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0.5"))
+DAILY_MAX_LOSS_PCT = float(os.getenv("DAILY_MAX_LOSS_PCT", "2.0"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))
+LIVE_ORDER_EXECUTION = os.getenv("LIVE_ORDER_EXECUTION", "0").lower() in ("1", "true", "yes")
+OTONOM_TRADE_AKTIF = os.getenv("OTONOM_TRADE_AKTIF", "1").lower() in ("1", "true", "yes")
+TRADE_ANALIZ_INTERVAL_MIN = int(os.getenv("TRADE_ANALIZ_INTERVAL_MIN", "60"))
 # ----------------------
 
 MAX_POSTS_PER_DAY = int(os.getenv("MAX_POSTS_PER_DAY", "4"))
@@ -48,6 +76,7 @@ RAPOR_DURUM_DOSYASI = os.path.join(os.path.dirname(__file__), "report_state.json
 RAPOR_ARSIV_KLASORU = os.path.join(os.path.dirname(__file__), "rapor_arsiv")
 STABLE_PROFILE_FILE = os.path.join(os.path.dirname(__file__), "stable_profile.json")
 STABLE_MODE = os.getenv("STABLE_MODE", "1").lower() in ("1", "true", "yes")
+TEST_TEK_SEFER_MOLTBOOK_ARA_DOSYASI = os.path.join(os.path.dirname(__file__), "test_once_moltbook_break.flag")
 
 RAPOR_EMAIL_TO = os.getenv("RAPOR_EMAIL_TO", "").strip()
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
@@ -63,12 +92,19 @@ if not OPENAI_API_KEY or not MOLTBOOK_API_KEY:
 
 MEMORY_FILE = os.path.join(os.path.dirname(__file__), "learned_memory.json")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "post_history.json")
+TRADE_JOURNAL_FILE = os.path.join(os.path.dirname(__file__), "trade_journal.json")
+TRADE_QUEUE_FILE = os.path.join(os.path.dirname(__file__), "trade_order_queue.json")
+MT5_BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), "mt5_bridge.py")
+MT5_OUTBOX_FILE = os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_orders_outbox.csv")
+MT5_RESULT_FILE = os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_orders_result.csv")
+GUNLUK_DURUM_DOSYASI = os.path.join(os.path.dirname(__file__), "gunluk_trade_durum.json")
 
 # --- YARDIMCI FONKSİYONLAR (MEVCUT) ---
 def safe_request(method, url, max_attempts=3, backoff=2, **kwargs):
     attempt = 1
     while attempt <= max_attempts:
         try:
+            kwargs.setdefault("timeout", 20)
             response = getattr(requests, method)(url, **kwargs)
             return response
         except Exception as e:
@@ -76,6 +112,45 @@ def safe_request(method, url, max_attempts=3, backoff=2, **kwargs):
             if attempt == max_attempts: raise
             time.sleep(backoff * attempt)
             attempt += 1
+
+
+def yorum_gonder_with_retry(comment_url: str, headers: dict, icerik: str, max_attempts: int = 5):
+    gecici_hatalar = {429, 500, 502, 503, 504}
+    attempt = 1
+    while attempt <= max_attempts:
+        try:
+            res = safe_request("post", comment_url, json={"content": icerik}, headers=headers)
+        except Exception as e:
+            logger.warning(f"Yorum isteği exception (deneme {attempt}/{max_attempts}): {e}")
+            if attempt == max_attempts:
+                raise
+            bekleme = min(30, 2 * attempt) + random.uniform(0.2, 1.2)
+            time.sleep(bekleme)
+            attempt += 1
+            continue
+
+        if res.status_code in (200, 201):
+            return res
+
+        if res.status_code in gecici_hatalar and attempt < max_attempts:
+            if res.status_code == 429:
+                try:
+                    retry_after = int((res.json() or {}).get("retry_after_seconds", 0))
+                except Exception:
+                    retry_after = 0
+                bekleme = retry_after if retry_after > 0 else min(40, 3 * attempt) + random.uniform(0.2, 1.2)
+            else:
+                bekleme = min(40, 3 * attempt) + random.uniform(0.2, 1.2)
+            logger.warning(
+                f"Yorum geçici hata ({res.status_code}) deneme {attempt}/{max_attempts}, {bekleme:.1f}s sonra tekrar"
+            )
+            time.sleep(bekleme)
+            attempt += 1
+            continue
+
+        return res
+
+    return res
 
 def load_json(path, default):
     try:
@@ -100,7 +175,12 @@ def _to_bool(value, default=False):
 
 def stabil_profili_uygula():
     global SUBMOLT_NAME, POST_INTERVAL_SEC, LOOP_INTERVAL_SEC, REPORT_SLOTS
+    global WEEKLY_HEALTH_DAY, WEEKLY_HEALTH_TIME
     global MAX_POSTS_PER_DAY, RUN_CONTINUOUS, ARASTIRMA_MODU, POST_PAYLASIM_AKTIF, LOKAL_BILDIRIM_AKTIF
+    global TRADE_DENEYIM_PAYLASIM_AKTIF, TRADE_DENEYIM_SLOT, MT5_AKTIF
+    global MT5_BRIDGE_AKTIF, MT5_BRIDGE_PYTHON, MT5_FILE_BRIDGE_DIR, LIVE_ORDER_EXECUTION
+    global TRADE_EXECUTION_MODE, MAX_RISK_PER_TRADE_PCT, DAILY_MAX_LOSS_PCT, MAX_OPEN_TRADES
+    global OTONOM_TRADE_AKTIF, TRADE_ANALIZ_INTERVAL_MIN
 
     if not STABLE_MODE:
         logger.info("🔓 Stabil mod kapalı (STABLE_MODE=0).")
@@ -120,6 +200,25 @@ def stabil_profili_uygula():
     if isinstance(slotlar, list) and slotlar:
         REPORT_SLOTS = [str(s).strip() for s in slotlar if str(s).strip()]
 
+    WEEKLY_HEALTH_DAY = int(profil.get("WEEKLY_HEALTH_DAY", WEEKLY_HEALTH_DAY))
+    WEEKLY_HEALTH_TIME = str(profil.get("WEEKLY_HEALTH_TIME", WEEKLY_HEALTH_TIME)).strip() or WEEKLY_HEALTH_TIME
+    TRADE_DENEYIM_PAYLASIM_AKTIF = _to_bool(
+        profil.get("TRADE_DENEYIM_PAYLASIM_AKTIF", TRADE_DENEYIM_PAYLASIM_AKTIF),
+        TRADE_DENEYIM_PAYLASIM_AKTIF,
+    )
+    TRADE_DENEYIM_SLOT = str(profil.get("TRADE_DENEYIM_SLOT", TRADE_DENEYIM_SLOT)).strip() or TRADE_DENEYIM_SLOT
+    MT5_AKTIF = _to_bool(profil.get("MT5_AKTIF", MT5_AKTIF), MT5_AKTIF)
+    MT5_BRIDGE_AKTIF = _to_bool(profil.get("MT5_BRIDGE_AKTIF", MT5_BRIDGE_AKTIF), MT5_BRIDGE_AKTIF)
+    MT5_BRIDGE_PYTHON = str(profil.get("MT5_BRIDGE_PYTHON", MT5_BRIDGE_PYTHON)).strip() or MT5_BRIDGE_PYTHON
+    MT5_FILE_BRIDGE_DIR = str(profil.get("MT5_FILE_BRIDGE_DIR", MT5_FILE_BRIDGE_DIR)).strip() or MT5_FILE_BRIDGE_DIR
+    LIVE_ORDER_EXECUTION = _to_bool(profil.get("LIVE_ORDER_EXECUTION", LIVE_ORDER_EXECUTION), LIVE_ORDER_EXECUTION)
+    TRADE_EXECUTION_MODE = str(profil.get("TRADE_EXECUTION_MODE", TRADE_EXECUTION_MODE)).strip().lower() or TRADE_EXECUTION_MODE
+    MAX_RISK_PER_TRADE_PCT = float(profil.get("MAX_RISK_PER_TRADE_PCT", MAX_RISK_PER_TRADE_PCT))
+    DAILY_MAX_LOSS_PCT = float(profil.get("DAILY_MAX_LOSS_PCT", DAILY_MAX_LOSS_PCT))
+    MAX_OPEN_TRADES = int(profil.get("MAX_OPEN_TRADES", MAX_OPEN_TRADES))
+    OTONOM_TRADE_AKTIF = _to_bool(profil.get("OTONOM_TRADE_AKTIF", OTONOM_TRADE_AKTIF), OTONOM_TRADE_AKTIF)
+    TRADE_ANALIZ_INTERVAL_MIN = int(profil.get("TRADE_ANALIZ_INTERVAL_MIN", TRADE_ANALIZ_INTERVAL_MIN))
+
     RUN_CONTINUOUS = _to_bool(profil.get("RUN_CONTINUOUS", RUN_CONTINUOUS), RUN_CONTINUOUS)
     ARASTIRMA_MODU = _to_bool(profil.get("ARASTIRMA_MODU", ARASTIRMA_MODU), ARASTIRMA_MODU)
     POST_PAYLASIM_AKTIF = _to_bool(profil.get("POST_PAYLASIM_AKTIF", POST_PAYLASIM_AKTIF), POST_PAYLASIM_AKTIF)
@@ -134,6 +233,277 @@ LEARNED_MEMORY = load_json(MEMORY_FILE, {})
 POST_HISTORY = load_json(HISTORY_FILE, [])
 RAPOR_DURUMU = load_json(RAPOR_DURUM_DOSYASI, {"sent_slots": []})
 stabil_profili_uygula()
+
+if "weekly_slots" not in RAPOR_DURUMU:
+    RAPOR_DURUMU["weekly_slots"] = []
+if "trade_experience_slots" not in RAPOR_DURUMU:
+    RAPOR_DURUMU["trade_experience_slots"] = []
+
+MT5_CONNECTED = False
+MT5_BACKEND = "none"
+son_trade_analiz_zamani = 0.0
+ai_firsat_yok_serisi = 0
+son_xau_bid = None
+
+
+def mt5_outbox_file():
+    return os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_orders_outbox.csv")
+
+
+def mt5_result_file():
+    return os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_orders_result.csv")
+
+
+def trade_queue_yukle():
+    data = load_json(TRADE_QUEUE_FILE, {"orders": []})
+    if isinstance(data, dict) and isinstance(data.get("orders"), list):
+        return data
+    return {"orders": []}
+
+
+def trade_queue_kaydet(queue_data):
+    save_json(TRADE_QUEUE_FILE, queue_data)
+
+
+def aktif_order_sayisi(queue_data):
+    return len([o for o in queue_data.get("orders", []) if o.get("status") in {"approved", "queued", "sent", "open"}])
+
+
+def trade_komutu_parse_et(mesaj: str):
+    metin = (mesaj or "").strip().lower()
+    if not ("işlem" in metin or "islem" in metin):
+        return None
+
+    ust = (mesaj or "").upper()
+    adaylar = re.findall(r"\b([A-Z]{6,7})\b", ust)
+    gecerli_quote = {"USD", "EUR", "TRY", "JPY", "GBP", "CHF", "AUD", "CAD", "NZD", "USDT"}
+    symbol = None
+    for aday in adaylar:
+        if aday in {"MARKET", "ONAYLA", "IPTAL", "TRADE", "ORDER"}:
+            continue
+        if len(aday) == 6 and aday[3:] in gecerli_quote:
+            symbol = aday
+            break
+        if aday in {"XAUUSD", "XAGUSD", "BTCUSD", "ETHUSD", "BTCUSDT", "ETHUSDT"}:
+            symbol = aday
+            break
+
+    side_m = re.search(r"\b(buy|long|sell|short)\b", metin)
+    sl_m = re.search(r"\bsl\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\b", metin)
+    tp_m = re.search(r"\btp\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\b", metin)
+    lot_m = re.search(r"\b(?:lot|volume|vol)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\b", metin)
+
+    if not symbol or not side_m or not sl_m or not tp_m:
+        return None
+
+    side_raw = side_m.group(1)
+    side = "buy" if side_raw in {"buy", "long"} else "sell"
+    return {
+        "symbol": symbol,
+        "side": side,
+        "sl": float(sl_m.group(1)),
+        "tp": float(tp_m.group(1)),
+        "lot": float(lot_m.group(1)) if lot_m else 0.01,
+    }
+
+
+def trade_emri_dogrula(order):
+    if order["lot"] <= 0:
+        return False, "Lot 0'dan büyük olmalı."
+    if order["lot"] > 5:
+        return False, "Lot çok yüksek. Güvenlik nedeniyle reddedildi."
+    if order["sl"] <= 0 or order["tp"] <= 0:
+        return False, "SL/TP pozitif olmalı."
+    if order["side"] == "buy" and order["tp"] <= order["sl"]:
+        return False, "Buy için TP > SL olmalı."
+    if order["side"] == "sell" and order["tp"] >= order["sl"]:
+        return False, "Sell için TP < SL olmalı."
+    return True, "OK"
+
+
+def trade_emri_ekle(order, source="chat"):
+    queue_data = trade_queue_yukle()
+    if aktif_order_sayisi(queue_data) >= MAX_OPEN_TRADES:
+        return None, f"Aktif emir limiti dolu (MAX_OPEN_TRADES={MAX_OPEN_TRADES})."
+
+    ok, neden = trade_emri_dogrula(order)
+    if not ok:
+        return None, neden
+
+    order_id = str(uuid.uuid4())[:8]
+    status = "approved" if TRADE_EXECUTION_MODE == "auto" else "pending_approval"
+    kayit = {
+        "id": order_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "source": source,
+        "symbol": order["symbol"],
+        "side": order["side"],
+        "lot": order["lot"],
+        "sl": order["sl"],
+        "tp": order["tp"],
+        "status": status,
+        "risk_cap_pct": MAX_RISK_PER_TRADE_PCT,
+    }
+    queue_data["orders"].append(kayit)
+    trade_queue_kaydet(queue_data)
+    return kayit, None
+
+
+def trade_emri_onayla(order_id: str):
+    queue_data = trade_queue_yukle()
+    for order in queue_data.get("orders", []):
+        if order.get("id") == order_id:
+            if order.get("status") != "pending_approval":
+                return False, f"Emir bu durumda onaylanamaz: {order.get('status')}"
+            order["status"] = "approved"
+            order["approved_at"] = datetime.now().isoformat(timespec="seconds")
+            trade_queue_kaydet(queue_data)
+            return True, "Onaylandı"
+    return False, "Emir bulunamadı"
+
+
+def trade_emri_iptal(order_id: str):
+    queue_data = trade_queue_yukle()
+    for order in queue_data.get("orders", []):
+        if order.get("id") == order_id:
+            if order.get("status") in {"filled", "closed", "cancelled"}:
+                return False, f"Bu emir iptal edilemez: {order.get('status')}"
+            order["status"] = "cancelled"
+            order["cancelled_at"] = datetime.now().isoformat(timespec="seconds")
+            trade_queue_kaydet(queue_data)
+            return True, "İptal edildi"
+    return False, "Emir bulunamadı"
+
+
+def trade_kuyruk_ozeti(limit=3):
+    queue_data = trade_queue_yukle()
+    orders = queue_data.get("orders", [])[-limit:]
+    if not orders:
+        return "Emir kuyruğu boş."
+    satirlar = []
+    for o in orders:
+        satirlar.append(
+            f"#{o.get('id')} {o.get('symbol')} {o.get('side')} lot={o.get('lot')} sl={o.get('sl')} tp={o.get('tp')} status={o.get('status')}"
+        )
+    return "\n".join(satirlar)
+
+
+def mt5_file_bridge_emit(order):
+    try:
+        side = str(order.get("side", "")).lower().strip()
+        if side not in {"buy", "sell"}:
+            return False, f"invalid_side:{side or 'empty'}"
+
+        os.makedirs(MT5_FILE_BRIDGE_DIR, exist_ok=True)
+        outbox = mt5_outbox_file()
+        dosya_var = os.path.exists(outbox)
+        with open(outbox, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not dosya_var:
+                writer.writerow(["id", "created_at", "symbol", "side", "lot", "sl", "tp", "comment"])
+            writer.writerow([
+                order.get("id"),
+                order.get("created_at"),
+                order.get("symbol"),
+                side,
+                order.get("lot"),
+                order.get("sl"),
+                order.get("tp"),
+                f"ovrthnk-{order.get('id')}",
+            ])
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def mt5_file_bridge_sonuclari_isle(queue_data):
+    result_path = mt5_result_file()
+    if not os.path.exists(result_path):
+        return False
+
+    degisti = False
+    try:
+        with open(result_path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return False
+
+    if not rows:
+        return False
+
+    id_to_order = {o.get("id"): o for o in queue_data.get("orders", [])}
+    for row in rows[-200:]:
+        oid = row.get("id")
+        status = (row.get("status") or "").lower()
+        ticket = row.get("ticket")
+        if not oid or oid not in id_to_order:
+            continue
+        o = id_to_order[oid]
+        if status in {"filled", "open", "sent", "failed", "rejected", "closed"}:
+            if o.get("status") != status:
+                o["status"] = status
+                o["ticket"] = ticket or o.get("ticket")
+                o["mt5_note"] = row.get("note", "")
+                degisti = True
+    return degisti
+
+
+def trade_emir_yurutucu():
+    if not MT5_CONNECTED:
+        return
+    queue_data = trade_queue_yukle()
+    if MT5_BACKEND == "file-bridge":
+        if mt5_file_bridge_sonuclari_isle(queue_data):
+            trade_queue_kaydet(queue_data)
+
+    degisti = False
+    for order in queue_data.get("orders", []):
+        if order.get("status") not in {"approved", "queued"}:
+            continue
+        order["queued_at"] = datetime.now().isoformat(timespec="seconds")
+        if not LIVE_ORDER_EXECUTION:
+            order["status"] = "queued"
+            logger.info(f"🧾 Emir MT5 kuyruğuna alındı: #{order.get('id')} {order.get('symbol')} {order.get('side')}")
+            logger.info("Not: LIVE_ORDER_EXECUTION=0, bu yüzden emir gönderilmedi.")
+            degisti = True
+            continue
+
+        payload = {
+            "symbol": order.get("symbol"),
+            "side": order.get("side"),
+            "lot": order.get("lot"),
+            "sl": order.get("sl"),
+            "tp": order.get("tp"),
+            "comment": f"ovrthnk-{order.get('id')}",
+        }
+
+        if MT5_BACKEND == "bridge":
+            res = mt5_bridge_call("send_order", payload)
+            if res.get("ok"):
+                order["status"] = "sent"
+                order["sent_at"] = datetime.now().isoformat(timespec="seconds")
+                order["ticket"] = res.get("ticket")
+                logger.info(f"✅ Emir gönderildi (bridge): #{order.get('id')} ticket={order.get('ticket')}")
+            else:
+                order["status"] = "failed"
+                order["error"] = res.get("error", "send_order failed")
+                logger.warning(f"❌ Emir gönderilemedi (bridge): #{order.get('id')} {order.get('error')}")
+        elif MT5_BACKEND == "file-bridge":
+            ok, err = mt5_file_bridge_emit(order)
+            if ok:
+                order["status"] = "sent"
+                order["sent_at"] = datetime.now().isoformat(timespec="seconds")
+                logger.info(f"📤 Emir file-bridge outbox'a yazıldı: #{order.get('id')} -> {mt5_outbox_file()}")
+            else:
+                order["status"] = "failed"
+                order["error"] = err
+                logger.warning(f"❌ Emir outbox yazımı başarısız: #{order.get('id')} {err}")
+        else:
+            order["status"] = "queued"
+            logger.info(f"🧾 Emir direct backend için kuyruğa alındı: #{order.get('id')} (direct execution henüz aktif değil)")
+        degisti = True
+    if degisti:
+        trade_queue_kaydet(queue_data)
 
 def can_post():
     now = time.time()
@@ -205,12 +575,150 @@ def sonraki_rapor_saati(now: datetime):
 def sistem_durum_ozeti():
     email_durumu = "AKTİF" if email_hazir_mi() else "PASİF (SMTP/.env eksik)"
     stabil_durumu = "AKTİF" if STABLE_MODE else "PASİF"
+    deneyim_durumu = "AKTİF" if TRADE_DENEYIM_PAYLASIM_AKTIF else "PASİF"
+    mt5_durumu = "AKTİF" if MT5_AKTIF else "PASİF"
+    live_durumu = "AÇIK" if LIVE_ORDER_EXECUTION else "KAPALI"
     return (
         f"- Stabil mod: {stabil_durumu}\n"
         f"- Rapor üretimi: AKTİF, saatler {', '.join(REPORT_SLOTS)}\n"
+        f"- Haftalık sağlık raporu: {WEEKLY_HEALTH_DAY}. gün {WEEKLY_HEALTH_TIME}\n"
+        f"- İşlem deneyimi paylaşımı: {deneyim_durumu}, saat {TRADE_DENEYIM_SLOT}\n"
+        f"- MT5 bağlantı modülü: {mt5_durumu} ({MT5_BACKEND})\n"
+        f"- Live emir gönderimi: {live_durumu}\n"
         f"- E-posta gönderimi: {email_durumu}\n"
         f"- Post paylaşım aralığı: {POST_INTERVAL_SEC // 3600} saatte 1\n"
         f"- Döngü aralığı: {LOOP_INTERVAL_SEC // 60} dk"
+    )
+
+
+def mt5_hazir_mi():
+    return MT5_AKTIF
+
+
+def mt5_bridge_call(action: str, payload: dict | None = None):
+    if not MT5_BRIDGE_AKTIF:
+        return {"ok": False, "error": "bridge disabled"}
+    if not os.path.exists(MT5_BRIDGE_SCRIPT):
+        return {"ok": False, "error": f"bridge script missing: {MT5_BRIDGE_SCRIPT}"}
+    try:
+        cmd = [MT5_BRIDGE_PYTHON, MT5_BRIDGE_SCRIPT, action, json.dumps(payload or {}, ensure_ascii=False)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        raw = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+        if not raw:
+            return {"ok": False, "error": "empty bridge response"}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {"ok": False, "error": f"invalid bridge json: {raw[:220]}"}
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "bridge response not dict"}
+        return data
+    except Exception as e:
+        return {"ok": False, "error": f"bridge call failed: {e}"}
+
+
+def mt5_baglan():
+    global MT5_CONNECTED, MT5_BACKEND
+    if not mt5_hazir_mi():
+        logger.info("MT5 modülü pasif.")
+        MT5_CONNECTED = False
+        MT5_BACKEND = "none"
+        return False
+
+    if mt5 is None:
+        bridge = mt5_bridge_call("ping", {})
+        if bridge.get("ok"):
+            MT5_CONNECTED = True
+            MT5_BACKEND = "bridge"
+            return True
+        logger.warning(f"MT5 bridge bağlantısı başarısız: {bridge.get('error', 'unknown')} | import_err={MT5_IMPORT_ERROR}")
+        MT5_CONNECTED = True
+        MT5_BACKEND = "file-bridge"
+        logger.info(f"MT5 file-bridge aktif: {MT5_FILE_BRIDGE_DIR}")
+        return True
+
+    try:
+        if MT5_PATH:
+            inited = mt5.initialize(path=MT5_PATH)
+        else:
+            inited = mt5.initialize()
+
+        if not inited:
+            logger.warning(f"MT5 initialize başarısız: {mt5.last_error()}")
+            MT5_CONNECTED = False
+            MT5_BACKEND = "none"
+            return False
+
+        if MT5_LOGIN and MT5_PASSWORD and MT5_SERVER:
+            ok = mt5.login(login=int(MT5_LOGIN), password=MT5_PASSWORD, server=MT5_SERVER)
+            if not ok:
+                logger.warning(f"MT5 login başarısız: {mt5.last_error()}")
+                MT5_CONNECTED = False
+                MT5_BACKEND = "none"
+                return False
+
+        MT5_CONNECTED = True
+        MT5_BACKEND = "direct"
+        return True
+    except Exception as e:
+        logger.warning(f"MT5 bağlantı hatası: {e}")
+        MT5_CONNECTED = False
+        MT5_BACKEND = "none"
+        return False
+
+
+def mt5_hesap_ozeti():
+    if not MT5_CONNECTED:
+        return None
+    if MT5_BACKEND == "bridge":
+        info = mt5_bridge_call("account_info", {})
+        if not info.get("ok"):
+            return None
+        return info.get("account")
+    if MT5_BACKEND == "file-bridge":
+        ozet = mt5_dosya_hesap_ozeti()
+        if not ozet:
+            return None
+        return {
+            "login": 0,
+            "server": "file-bridge",
+            "balance": float(ozet.get("balance") or 0),
+            "equity": float(ozet.get("equity") or 0),
+            "margin": float((ozet.get("balance") or 0) - (ozet.get("margin_free") or 0)),
+            "currency": "USD",
+        }
+    try:
+        info = mt5.account_info()
+        if info is None:
+            return None
+        return {
+            "login": info.login,
+            "server": info.server,
+            "balance": float(info.balance),
+            "equity": float(info.equity),
+            "margin": float(info.margin),
+            "currency": info.currency,
+        }
+    except Exception:
+        return None
+
+
+def mt5_saglik_kontrolu():
+    if not mt5_hazir_mi():
+        return
+
+    if not mt5_baglan():
+        logger.warning("MT5 bağlantısı kurulamadı.")
+        return
+
+    ozet = mt5_hesap_ozeti()
+    if not ozet:
+        logger.warning("MT5 hesap bilgisi okunamadı.")
+        return
+
+    logger.info(
+        f"MT5 bağlantısı OK ({MT5_BACKEND}) | login={ozet['login']} server={ozet['server']} "
+        f"balance={ozet['balance']:.2f} {ozet['currency']} equity={ozet['equity']:.2f}"
     )
 
 
@@ -229,6 +737,33 @@ def katı_gercek_cevap(kullanici_mesaji: str):
             f"Raporlar her gün {', '.join(REPORT_SLOTS)} saatlerinde üretiliyor ama e-posta gönderimi şu an aktif değil. "
             f"Bu yazılımda SMTP ayarı yoksa mail atamam. İstersen SMTP ayarlarını (.env) birlikte kodlayıp aktif edelim."
         )
+    onay_m = re.search(r"\b(onayla|approve)\s+([a-z0-9]{6,12})\b", metin)
+    iptal_m = re.search(r"\b(iptal|cancel)\s+([a-z0-9]{6,12})\b", metin)
+    kuyruk_sorusu = any(k in metin for k in ["kuyruk", "emirler", "orders", "işlem listesi", "islem listesi"])
+
+    if onay_m:
+        ok, msg = trade_emri_onayla(onay_m.group(2))
+        return ("Emir onaylandı." if ok else f"Onay başarısız: {msg}") + f"\n{trade_kuyruk_ozeti()}"
+
+    if iptal_m:
+        ok, msg = trade_emri_iptal(iptal_m.group(2))
+        return ("Emir iptal edildi." if ok else f"İptal başarısız: {msg}") + f"\n{trade_kuyruk_ozeti()}"
+
+    if kuyruk_sorusu:
+        return f"Emir kuyruğu:\n{trade_kuyruk_ozeti()}"
+
+    parsed = trade_komutu_parse_et(kullanici_mesaji)
+    if parsed:
+        kayit, hata = trade_emri_ekle(parsed)
+        if hata:
+            return f"Emir reddedildi: {hata}"
+        if TRADE_EXECUTION_MODE == "auto":
+            return f"Emir alındı ve otomatik onaylandı: #{kayit['id']}\n{trade_kuyruk_ozeti()}"
+        return (
+            f"Emir kaydedildi: #{kayit['id']} (durum: {kayit['status']}). "
+            f"Onaylamak için: 'onayla {kayit['id']}'\n{trade_kuyruk_ozeti()}"
+        )
+
     return None
 
 
@@ -238,6 +773,21 @@ def metin_temizle(metin: str):
     temiz = re.sub(r"(?m)^(Başlık:|Mesaj:)\s*", "", temiz)
     temiz = temiz.replace("**", "")
     return temiz.strip()
+
+
+def yorum_uzunlugu_profili(gelen_yorum: str):
+    metin = (gelen_yorum or "").lower()
+    ilgi_anahtar = [
+        "forex", "xauusd", "eurusd", "usdtry", "fed", "faiz", "enflasyon", "cpi", "nfp",
+        "teknik analiz", "fundamental", "jeopolitik", "risk", "likidite", "opsiyon",
+        "vr", "playstation", "yapay zeka", "ai", "machine learning", "emlak", "müzik",
+        "algoritma", "model", "biliş", "cognition", "memory", "digital",
+    ]
+    eslesme = sum(1 for k in ilgi_anahtar if k in metin)
+    kelime_sayisi = len(re.findall(r"\w+", metin, flags=re.UNICODE))
+    if eslesme >= 2 or kelime_sayisi >= 70:
+        return "derin"
+    return "kisa"
 
 
 def uygunluk_puani_hesapla(metin: str, icerik_tipi: str):
@@ -263,7 +813,7 @@ def uygunluk_puani_hesapla(metin: str, icerik_tipi: str):
         if kelime_sayisi < 6:
             puan -= 15
             nedenler.append("çok kısa yorum")
-        if kelime_sayisi > 70:
+        if kelime_sayisi > 120:
             puan -= 20
             nedenler.append("çok uzun yorum")
     else:
@@ -308,6 +858,7 @@ KESİN KURALLAR:
 - Gerektiğinde espri yap, gerektiğinde sert yorum yap. İnsan gibi davran.
 - Asla var olmayan bir özelliği varmış gibi konuşma. Bilmiyorsan net biçimde "bilmiyorum" de.
 - Kullanıcı bir özellik sorarsa gerçek sistem durumuna göre cevap ver; uydurma vaat verme.
+- POZİSYON KURALI: Açık pozisyon varken Moltbook'ta giriş fiyatı, SL, TP, lot veya yön PAYLAŞMA. Sadece genel piyasa yorumu yapabilirsin. Trade detayları (sembol, yön, giriş, SL/TP, sonuç) YALNIZCA pozisyon kapandıktan sonra özet/değerlendirme şeklinde paylaşılır.
 
 ÜSLUP:
 - Sade, samimi, teknik ama anlaşılır.
@@ -344,8 +895,14 @@ def ajana_sor(soru_tipi, gelen_yorum=None):
 
     prompt = f"{KARAKTER}{arastirma_notu}\n\nGörev: {soru_tipi}"
     if gelen_yorum:
+        uzunluk_profili = yorum_uzunlugu_profili(gelen_yorum)
+        yorum_kurali = (
+            "Buna 3-5 cümleyle, biraz daha derin ama sade bir yorum yaz."
+            if uzunluk_profili == "derin"
+            else "Buna en fazla 2 cümleyle kısa, doğal, sakin bir yorum yaz."
+        )
         prompt += (
-            f"\n\nİçerik: '{gelen_yorum}'. Buna en fazla 2 cümleyle kısa, doğal, sakin bir yorum yaz. "
+            f"\n\nİçerik: '{gelen_yorum}'. {yorum_kurali} "
             "Hitap cümlesi kurma, ukalalık yapma, çengel soru zorlaması yapma."
         )
     else:
@@ -392,6 +949,12 @@ def check_service_health():
     except Exception as e:
         logger.error(f"Moltbook bağlantı sorunu: {e}")
 
+    mt5_saglik_kontrolu()
+    logger.info(
+        f"Risk limitleri | mode={TRADE_EXECUTION_MODE} risk/trade={MAX_RISK_PER_TRADE_PCT}% "
+        f"daily_max_loss={DAILY_MAX_LOSS_PCT}% max_open={MAX_OPEN_TRADES}"
+    )
+
 
 def record_post():
     POST_HISTORY.append(time.time())
@@ -420,6 +983,308 @@ def rapor_mail_gonder(konu: str, govde: str):
     except Exception as e:
         logger.warning(f"Rapor e-posta gönderilemedi: {e}")
         return False
+
+
+def haftalik_slot_hazir_mi(now: datetime):
+    try:
+        saat, dakika = WEEKLY_HEALTH_TIME.split(":")
+        hedef_dk = int(saat) * 60 + int(dakika)
+    except Exception:
+        hedef_dk = 21 * 60
+
+    simdi_dk = now.hour * 60 + now.minute
+    return now.weekday() == WEEKLY_HEALTH_DAY and simdi_dk >= hedef_dk
+
+
+def haftalik_slot_id(now: datetime):
+    iso = now.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}-{WEEKLY_HEALTH_DAY}@{WEEKLY_HEALTH_TIME}"
+
+
+def trade_denemesi_slot_hazir_mi(now: datetime):
+    try:
+        saat, dakika = TRADE_DENEYIM_SLOT.split(":")
+        hedef_dk = int(saat) * 60 + int(dakika)
+    except Exception:
+        hedef_dk = 23 * 60
+    simdi_dk = now.hour * 60 + now.minute
+    return simdi_dk >= hedef_dk
+
+
+def trade_denemesi_slot_id(now: datetime):
+    return f"{now.strftime('%Y-%m-%d')}@{TRADE_DENEYIM_SLOT}"
+
+
+def trade_journal_yukle():
+    data = load_json(TRADE_JOURNAL_FILE, [])
+    if isinstance(data, list):
+        return data[-20:]
+    return []
+
+
+def islem_denemesi_tecrube_metni_uret(girdiler):
+    icerikler = []
+    for kayit in girdiler:
+        sembol = kayit.get("symbol", "?")
+        yon = kayit.get("side", "?")
+        sonuc = kayit.get("result", kayit.get("pnl", "?"))
+        notu = (kayit.get("note") or "").replace("\n", " ")[:240]
+        icerikler.append(f"- {sembol} | {yon} | sonuç={sonuc} | not={notu}")
+
+    prompt = (
+        "Aşağıdaki işlem günlüklerinden Moltbook için tek bir paylaşım yaz. "
+        "Kişisel deneyim, his ve çıkarım aktar; rapor dili kullanma. "
+        "Kısa, samimi, teknik ve dürüst ol. 'kesin kazanç' gibi iddialar yazma. "
+        "2-5 kısa paragraf yeterli. Selamlama yok.\n\n"
+        + "\n".join(icerikler)
+    )
+    yanit = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": KARAKTER},
+            {"role": "user", "content": prompt},
+        ],
+    ).choices[0].message.content
+    return metin_temizle(yanit)
+
+
+def trade_denemesi_tecrubesi_paylas():
+    if not TRADE_DENEYIM_PAYLASIM_AKTIF:
+        return
+
+    now = datetime.now()
+    if not trade_denemesi_slot_hazir_mi(now):
+        return
+
+    slot_id = trade_denemesi_slot_id(now)
+    slots = RAPOR_DURUMU.get("trade_experience_slots", [])
+    if slot_id in slots:
+        return
+
+    girdiler = trade_journal_yukle()
+    if not girdiler:
+        logger.info("İşlem günlüğü boş, deneyim paylaşımı atlandı.")
+        return
+
+    if not can_post():
+        logger.info("Günlük post limiti dolu, deneyim paylaşımı atlandı.")
+        return
+
+    post_text = islem_denemesi_tecrube_metni_uret(girdiler)
+    puan, nedenler = uygunluk_puani_hesapla(post_text, "post")
+    if puan < 75:
+        logger.info(f"⛔ Deneyim postu atlanıyor (puan {puan}/100): {', '.join(nedenler) if nedenler else 'düşük kalite'}")
+        return
+
+    title = post_text.strip().split("\n")[0][:80] or "İşlem Günü Notları"
+    url = "https://www.moltbook.com/api/v1/posts"
+    headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}", "Content-Type": "application/json"}
+    body = {"submolt_name": SUBMOLT_NAME, "title": title, "content": post_text}
+    res = safe_request("post", url, json=body, headers=headers)
+
+    if res.status_code in (200, 201):
+        logger.info(f"📌 Deneyim paylaşımı yapıldı: {title}")
+        record_post()
+        slots.append(slot_id)
+        RAPOR_DURUMU["trade_experience_slots"] = slots[-120:]
+        save_json(RAPOR_DURUM_DOSYASI, RAPOR_DURUMU)
+    else:
+        logger.warning(f"Deneyim paylaşımı başarısız: {res.status_code} - {res.text[:250]}")
+
+
+# --- KAPALI POZİSYON ÖZET PAYLAŞIMI ---
+TRADE_OZET_BEKLEME_SAAT = 1  # filled'dan bu kadar saat geçtikten sonra paylaş
+
+def _kapali_islem_ozet_uret(order: dict) -> str:
+    """GPT-4o ile kapanmış pozisyon değerlendirmesi üret."""
+    sembol = order.get("symbol", "?")
+    yon = order.get("side", "?")
+    lot = order.get("lot", "?")
+    sl = order.get("sl", "?")
+    tp = order.get("tp", "?")
+    kaynak = order.get("source", "")
+    # ai_auto:neden formatından gerekçeyi çıkar
+    neden = ""
+    if kaynak.startswith("ai_auto:"):
+        neden = kaynak[len("ai_auto:"):]
+    ticket = order.get("ticket") or "-"
+    filled_at = order.get("filled_at") or order.get("sent_at") or ""
+
+    icerik = (
+        f"Sembol: {sembol}\n"
+        f"Yön: {yon}\n"
+        f"Lot: {lot}\n"
+        f"SL: {sl} | TP: {tp}\n"
+        f"Ticket: {ticket}\n"
+        f"Giriş zamanı: {filled_at}\n"
+        f"AI gerekçesi: {neden if neden else 'manuel/test işlem'}\n"
+    )
+    prompt = (
+        "Aşağıdaki işlemin kapandıktan sonraki Moltbook özet değerlendirmesini yaz.\n"
+        "Şunları mutlaka kapsa:\n"
+        "1. Bu işleme neden girildi (kısa, dürüst)\n"
+        "2. Risk yönetimi (lot, SL/TP mantığı)\n"
+        "3. Psikolojik etki: bu tür işlem nasıl bir his yaratır, traderın zihnine ne yapar?\n"
+        "4. Öğrenilen ders (varsa)\n"
+        "Kısa, samimi, kişisel yaz. Selamlama yok, reklam yok. "
+        "SL/TP rakamlarını tekrar YAZMA — onlar geride kaldı. "
+        "Analizini ve psikolojik değerlendirmeni öne çıkar.\n\n"
+        f"{icerik}"
+    )
+    yanit = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": KARAKTER},
+            {"role": "user", "content": prompt},
+        ],
+    ).choices[0].message.content
+    return metin_temizle(yanit)
+
+
+def kapali_islem_ozet_paylas():
+    """Doldurulan (filled) emirleri için pozisyon kapandıktan sonra Moltbook özeti paylaş."""
+    if not POST_PAYLASIM_AKTIF:
+        return
+
+    queue_data = trade_queue_yukle()
+    orders = queue_data.get("orders", [])
+    simdi = datetime.now()
+    degisti = False
+
+    for order in orders:
+        if order.get("status") not in {"filled", "closed"}:
+            continue
+        if order.get("shared_at"):
+            continue  # zaten paylaşıldı
+
+        # filled/sent_at zamanı kontrolü — en az TRADE_OZET_BEKLEME_SAAT kadar geçmeli
+        zaman_str = order.get("filled_at") or order.get("sent_at") or ""
+        if zaman_str:
+            try:
+                zaman = datetime.fromisoformat(zaman_str)
+                fark_saat = (simdi - zaman).total_seconds() / 3600
+                if fark_saat < TRADE_OZET_BEKLEME_SAAT:
+                    continue  # henüz erken, bekle
+            except Exception:
+                pass  # zaman parse edemedik, yine de devam et
+
+        if not can_post():
+            logger.info("Günlük post limiti dolu, kapanış özeti atlandı.")
+            return
+
+        try:
+            post_text = _kapali_islem_ozet_uret(order)
+        except Exception as e:
+            logger.warning(f"Kapanış özeti üretilemedi ({order.get('id')}): {e}")
+            continue
+
+        puan, nedenler = uygunluk_puani_hesapla(post_text, "post")
+        if puan < 70:
+            logger.info(f"⛔ Kapanış özeti atlanıyor (puan {puan}/100, id={order.get('id')}): {', '.join(nedenler or [])}")
+            order["shared_at"] = f"SKIP:{simdi.isoformat(timespec='seconds')}"
+            degisti = True
+            continue
+
+        title = post_text.strip().split("\n")[0][:80] or f"{order.get('symbol', '?')} İşlem Özeti"
+        url = "https://www.moltbook.com/api/v1/posts"
+        headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}", "Content-Type": "application/json"}
+        body = {"submolt_name": SUBMOLT_NAME, "title": title, "content": post_text}
+        res = safe_request("post", url, json=body, headers=headers)
+
+        if res.status_code in (200, 201):
+            order["shared_at"] = simdi.isoformat(timespec="seconds")
+            logger.info(f"📊 Kapanış özeti paylaşıldı: {order.get('symbol')} {order.get('side')} → {title}")
+            record_post()
+            degisti = True
+        else:
+            logger.warning(f"Kapanış özeti gönderilemedi ({order.get('id')}): {res.status_code} - {res.text[:200]}")
+
+    if degisti:
+        trade_queue_kaydet(queue_data)
+
+
+def haftalik_saglik_raporu_uret_ve_gonder(slot_id: str):
+    logger.info(f"🧭 Haftalık sağlık raporu hazırlanıyor ({slot_id})...")
+    url = f"https://www.moltbook.com/api/v1/posts?submolt_name={SUBMOLT_NAME}&limit=40"
+    headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
+    res = safe_request("get", url, headers=headers)
+    if res.status_code != 200:
+        logger.warning(f"Haftalık rapor için postlar çekilemedi: {res.status_code}")
+        return False
+
+    posts = res.json().get("posts", [])
+    if not posts:
+        rapor = (
+            f"🧭 Haftalık Sağlık Raporu ({slot_id})\n\n"
+            "Bu hafta yeterli veri bulunamadı."
+        )
+    else:
+        kisa_akıs = []
+        for post in posts[:30]:
+            author = post.get("author", {}).get("username") or "bilinmiyor"
+            title = post.get("title", "Başlıksız")
+            content = (post.get("content", "") or "").replace("\n", " ")[:220]
+            kisa_akıs.append(f"- @{author} | {title} | {content}")
+
+        toplam_post = len(posts)
+        benzersiz_yazar = len({(p.get("author", {}) or {}).get("username") for p in posts if (p.get("author", {}) or {}).get("username")})
+
+        analiz_prompt = (
+            "Aşağıdaki Moltbook akışından haftalık sağlık raporu çıkar. "
+            "Kısa ve net yaz. Klinik teşhis YAPMA. 'Psikolojik Durum' bölümünü sadece ekosistem ruh hali olarak değerlendir. "
+            "Şu başlıklar zorunlu: 'Genel Sağlık', 'Riskler', 'Fırsatlar', 'Psikolojik Durum (Ekosistem Ruh Hali, Klinik Değil)', 'Önerilen Aksiyonlar'. "
+            "Her başlık altında en fazla 5 madde yaz. Uydurma bilgi yazma.\n\n"
+            + "\n".join(kisa_akıs)
+        )
+        analiz = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": KARAKTER},
+                {"role": "user", "content": analiz_prompt},
+            ],
+        ).choices[0].message.content.strip()
+
+        rapor = (
+            f"🧭 Haftalık Sağlık Raporu ({slot_id})\n\n"
+            f"- İncelenen post: {toplam_post}\n"
+            f"- Benzersiz yazar: {benzersiz_yazar}\n\n"
+            f"{analiz}\n"
+        )
+
+    haftalik_file = os.path.join(os.path.dirname(__file__), "haftalik_saglik_raporu.txt")
+    with open(haftalik_file, "w", encoding="utf-8") as f:
+        f.write(rapor)
+    logger.info(f"🩺 Haftalık rapor güncellendi: {haftalik_file}")
+
+    os.makedirs(RAPOR_ARSIV_KLASORU, exist_ok=True)
+    arsiv_adi = f"haftalik_{slot_id.replace(':', '-').replace(' ', '_')}.txt"
+    arsiv_yolu = os.path.join(RAPOR_ARSIV_KLASORU, arsiv_adi)
+    with open(arsiv_yolu, "w", encoding="utf-8") as f:
+        f.write(rapor)
+    logger.info(f"🗂️ Haftalık rapor arşive kaydedildi: {arsiv_yolu}")
+
+    rapor_mail_gonder(f"Haftalık Sağlık Raporu - {slot_id}", rapor)
+    return True
+
+
+def haftalik_saglik_raporu_kontrolu_ve_gonderimi():
+    now = datetime.now()
+    if not haftalik_slot_hazir_mi(now):
+        return
+
+    slot_id = haftalik_slot_id(now)
+    weekly_slots = RAPOR_DURUMU.get("weekly_slots", [])
+    if slot_id in weekly_slots:
+        return
+
+    basarili = haftalik_saglik_raporu_uret_ve_gonder(slot_id)
+    if not basarili:
+        return
+
+    weekly_slots.append(slot_id)
+    RAPOR_DURUMU["weekly_slots"] = weekly_slots[-60:]
+    save_json(RAPOR_DURUM_DOSYASI, RAPOR_DURUMU)
+    logger.info(f"✅ Haftalık sağlık raporu tamamlandı: {slot_id}")
 
 
 def firsatlari_ara_ve_rapor_et(slot_id: str):
@@ -543,7 +1408,7 @@ def diger_postlari_tara_ve_etkiles():
             logger.info(f"⛔ Yorum atlanıyor (uygunluk puanı {puan}/100): {', '.join(nedenler) if nedenler else 'düşük kalite'}")
             continue
         comment_url = f"https://www.moltbook.com/api/v1/posts/{post.get('id')}/comments"
-        yorum_res = safe_request("post", comment_url, json={"content": cevap}, headers=headers)
+        yorum_res = yorum_gonder_with_retry(comment_url, headers, cevap)
         if yorum_res.status_code in (200, 201):
             logger.info(f"💬 Yorum bırakıldı: {post.get('id')} (puan {puan}/100)")
             data = yorum_res.json()
@@ -624,11 +1489,442 @@ def kilidi_birak():
         pass
 
 
+
+# ─── OTONOM TRADE SİSTEMİ ──────────────────────────────────────────────────
+
+def mt5_account_state_file():
+    return os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_account_state.csv")
+
+
+def mt5_symbol_info_file():
+    return os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_symbol_info.csv")
+
+
+def mt5_symbol_request_file():
+    return os.path.join(MT5_FILE_BRIDGE_DIR, "ovrthnk_symbol_request.txt")
+
+
+def gunluk_durum_yukle() -> dict:
+    bugun = datetime.now().strftime("%Y-%m-%d")
+    data = load_json(GUNLUK_DURUM_DOSYASI, {})
+    if data.get("tarih") != bugun:
+        return {"tarih": bugun, "baslangic_bakiye": None, "acilan_islem_sayisi": 0}
+    return data
+
+
+def gunluk_durum_kaydet(durum: dict):
+    save_json(GUNLUK_DURUM_DOSYASI, durum)
+
+
+def mt5_dosya_hesap_ozeti() -> dict | None:
+    """EA'nın yazdığı account_state.csv dosyasından hesap bilgisi oku."""
+    state_path = mt5_account_state_file()
+    if not os.path.exists(state_path):
+        return None
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if rows:
+            r = rows[-1]
+            return {
+                "balance": float(r.get("balance") or 0),
+                "equity": float(r.get("equity") or 0),
+                "profit": float(r.get("profit") or 0),
+                "margin_free": float(r.get("margin_free") or 0),
+            }
+    except Exception as e:
+        logger.warning(f"Hesap durum dosyası okunamadı: {e}")
+    return None
+
+
+def sembol_bilgisi_al(symbol: str) -> dict | None:
+    """EA'dan sembol bilgisi iste ve oku (file-bridge üzerinden).
+    Spread, contract size, lot sınırları ve güncel bid/ask fiyatını döndürür.
+    EA yanıt vermezse None döner ve işlem açılmaz.
+    """
+    req_path = mt5_symbol_request_file()
+    info_path = mt5_symbol_info_file()
+    try:
+        if os.path.exists(info_path):
+            os.remove(info_path)
+        os.makedirs(MT5_FILE_BRIDGE_DIR, exist_ok=True)
+        with open(req_path, "w", encoding="utf-8") as f:
+            f.write(symbol.upper().strip())
+        for _ in range(15):
+            time.sleep(0.7)
+            if not os.path.exists(info_path):
+                continue
+            with open(info_path, "r", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            if rows and rows[0].get("symbol", "").upper() == symbol.upper():
+                r = rows[0]
+                return {
+                    "symbol": r.get("symbol"),
+                    "spread": float(r.get("spread") or 0),
+                    "contract_size": float(r.get("contract_size") or 100000),
+                    "min_lot": float(r.get("min_lot") or 0.01),
+                    "max_lot": float(r.get("max_lot") or 100),
+                    "lot_step": float(r.get("lot_step") or 0.01),
+                    "digits": int(float(r.get("digits") or 5)),
+                    "tick_value": float(r.get("tick_value") or 0),
+                    "tick_size": float(r.get("tick_size") or 0.00001),
+                    "bid": float(r.get("bid") or 0),
+                    "ask": float(r.get("ask") or 0),
+                }
+    except Exception as e:
+        logger.warning(f"Sembol bilgisi alınamadı ({symbol}): {e}")
+    return None
+
+
+def lot_hesapla(balance: float, risk_pct: float, sl_price_dist: float,
+                tick_value: float, tick_size: float,
+                lot_step: float, min_lot: float, max_lot: float) -> float:
+    """Risk yüzdesi ve SL mesafesine göre lot büyüklüğü hesapla."""
+    if tick_value <= 0 or tick_size <= 0 or sl_price_dist <= 0:
+        return min_lot
+    risk_amount = balance * (risk_pct / 100.0)
+    sl_ticks = sl_price_dist / tick_size
+    lot = risk_amount / (sl_ticks * tick_value)
+    lot = round(round(lot / lot_step) * lot_step, 8)
+    return min(max_lot, max(min_lot, lot))
+
+
+def bugunun_piyasa_arastirmasi(konu: str) -> str:
+    """Tavily ile YALNIZCA bugünün verilerini ara.
+    Sorguya bugünün tarihini ekleyerek eski verilerin karışmasını engeller.
+    """
+    if not tavily:
+        return "Tavily erişimi yok."
+    bugun_iso = datetime.now().strftime("%Y-%m-%d")
+    sorgular = [
+        f"{konu} today {bugun_iso}",
+        f"{konu} fundamental analysis {bugun_iso}",
+        f"{konu} market news geopolitical {bugun_iso}",
+    ]
+    sonuclar = []
+    for sorgu in sorgular:
+        try:
+            res = tavily.search(query=sorgu, search_depth="advanced", max_results=3)
+            if res.get("answer"):
+                sonuclar.append(f"[Özet] {res['answer']}")
+            for r in res.get("results", []):
+                sonuclar.append(f"[{r.get('url', '')}]\n{r.get('content', '')[:400]}")
+        except Exception as e:
+            logger.warning(f"Tavily hata ({sorgu[:60]}): {e}")
+    return "\n\n".join(sonuclar[:8]) if sonuclar else f"{konu} için güncel veri alınamadı."
+
+
+def otonom_trade_karari(hesap: dict, gunluk_durum: dict) -> list:
+    """GPT-4o + Tavily ile tam otonom trade kararı üret.
+    Temel analiz, teknik trend, jeopolitik → JSON emir listesi döndürür.
+    KESİN KURAL: Sadece bugünün verilerini kullanır.
+    """
+    bugun = datetime.now().strftime("%Y-%m-%d")
+    saat_str = datetime.now().strftime("%H:%M")
+    bakiye = hesap.get("balance", 0)
+    equity = hesap.get("equity", 0)
+    baslangic = gunluk_durum.get("baslangic_bakiye") or bakiye
+    gunluk_kayip_pct = max(0.0, ((baslangic - equity) / baslangic) * 100) if baslangic > 0 else 0.0
+    kalan_risk_pct = DAILY_MAX_LOSS_PCT - gunluk_kayip_pct
+
+    if gunluk_kayip_pct >= DAILY_MAX_LOSS_PCT:
+        logger.info(f"🛑 Günlük max kayıp ({gunluk_kayip_pct:.1f}% >= {DAILY_MAX_LOSS_PCT}%). Bugün işlem yok.")
+        return []
+
+    queue_data = trade_queue_yukle()
+    aktif = aktif_order_sayisi(queue_data)
+    if aktif >= MAX_OPEN_TRADES:
+        logger.info(f"📊 Açık işlem limiti dolu: {aktif}/{MAX_OPEN_TRADES}")
+        return []
+
+    logger.info(
+        f"🤖 Otonom analiz | bakiye={bakiye:.2f} equity={equity:.2f} "
+        f"günlük kayıp={gunluk_kayip_pct:.1f}% aktif={aktif}/{MAX_OPEN_TRADES}"
+    )
+    piyasa_verisi = bugunun_piyasa_arastirmasi("forex gold crypto index market")
+
+    karar_prompt = f"""Bugün: {bugun} | Saat: {saat_str} (Türkiye saati, UTC+3)
+Hesap bakiyesi: {bakiye:.2f} USD
+Equity: {equity:.2f} USD
+Günlük kayıp: {gunluk_kayip_pct:.1f}% (günlük limit: {DAILY_MAX_LOSS_PCT}%)
+Kalan risk bütçesi: {kalan_risk_pct:.1f}%
+Risk/işlem: max {MAX_RISK_PER_TRADE_PCT}% bakiye
+Açık işlem: {aktif}/{MAX_OPEN_TRADES}
+
+BUGÜNKÜ PİYASA VERİSİ ({bugun}):
+{piyasa_verisi}
+
+---
+MUTLAK KURAL: Sadece {bugun} tarihine ait verilerle karar ver. Başka tarihlere ait hiçbir veri geçerli değil.
+
+Görev:
+1. Temel analiz — bugünkü makro veriler (FOMC, CPI, istihdam, faiz kararları vb.)
+2. Teknik trend — destek/direnç seviyeleri, momentum yönü
+3. Jeopolitik risk — bugünkü gelişmelerin etkisi
+4. Spread yüksekse veya sinyal zayıfsa işlem açma
+5. Güçlü fırsat yoksa sadece [] döndür
+6. Fırsat varsa en fazla {MAX_OPEN_TRADES - aktif} işlem öner
+
+Çıktı: YALNIZCA JSON, başka hiçbir şey yazma:
+[
+  {{
+    "symbol": "XAUUSD",
+    "side": "buy",
+    "sl_price_dist": 5.0,
+    "tp_price_dist": 12.0,
+    "neden": "kısa gerekçe"
+  }}
+]
+
+sl_price_dist / tp_price_dist: giriş fiyatından gerçek fiyat mesafesi.
+Örnekler: XAUUSD=5.0 ($5 mesafe) | EURUSD=0.0050 (50 pip) | BTCUSD=200.0 ($200 mesafe).
+Fırsat yoksa: []"""
+
+    try:
+        yanit = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Deneyimli forex/CFD trader AI'sısın. "
+                        "Sadece JSON formatında cevap verirsin. "
+                        "Tarih dışı veri kullanmazsın, gerekçesiz işlem önermezsin."
+                    ),
+                },
+                {"role": "user", "content": karar_prompt},
+            ],
+            max_tokens=1200,
+        ).choices[0].message.content.strip()
+
+        json_match = re.search(r'\[.*?\]', yanit, re.DOTALL)
+        if not json_match:
+            logger.info("🤖 AI trade fırsatı bulmadı (sıkı mod). Esnek moda geçiliyor...")
+            kararlar = []
+        else:
+            kararlar = json.loads(json_match.group())
+            if not isinstance(kararlar, list):
+                kararlar = []
+
+        if kararlar:
+            logger.info(f"🤖 AI {len(kararlar)} fırsat: {[k.get('symbol') for k in kararlar]}")
+            return kararlar
+
+        esnek_prompt = f"""Bugün: {bugun} | Saat: {saat_str}
+Hesap: bakiye={bakiye:.2f}, equity={equity:.2f}
+Risk/işlem: max {MAX_RISK_PER_TRADE_PCT}% | Günlük limit: {DAILY_MAX_LOSS_PCT}%
+Açık işlem: {aktif}/{MAX_OPEN_TRADES}
+
+PİYASA VERİSİ ({bugun}):
+{piyasa_verisi}
+
+Kural:
+- Sadece bugünün verisi.
+- En fazla 1 işlem öner.
+- Sadece: XAUUSD, EURUSD, GBPUSD, USDJPY.
+- Risk zayıfsa [] döndürme; yalnızca veri tamamen yetersizse [] döndür.
+- RR en az 1:1.5 olsun (tp_price_dist >= 1.5 * sl_price_dist).
+- SL/TP gerçek fiyat mesafesi olarak yaz.
+
+YALNIZCA JSON:
+[
+  {{
+    "symbol": "XAUUSD",
+    "side": "buy",
+    "sl_price_dist": 5.0,
+    "tp_price_dist": 8.0,
+    "neden": "kısa gerekçe"
+  }}
+]"""
+
+        yanit2 = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Pratik ve risk kontrollü forex/CFD trader AI'sısın. "
+                        "Yalnızca JSON döndürürsün."
+                    ),
+                },
+                {"role": "user", "content": esnek_prompt},
+            ],
+            max_tokens=800,
+        ).choices[0].message.content.strip()
+
+        json_match2 = re.search(r'\[.*?\]', yanit2, re.DOTALL)
+        if not json_match2:
+            logger.info("🤖 AI trade fırsatı bulmadı (esnek mod).")
+            return []
+        kararlar2 = json.loads(json_match2.group())
+        if not isinstance(kararlar2, list):
+            return []
+        if kararlar2:
+            logger.info(f"🤖 AI esnek mod {len(kararlar2)} fırsat: {[k.get('symbol') for k in kararlar2]}")
+        else:
+            logger.info("🤖 AI trade fırsatı bulmadı.")
+        return kararlar2
+    except Exception as e:
+        logger.warning(f"Otonom trade karar hatası: {e}")
+        return []
+
+
+def otonom_trade_dongusu():
+    """Her döngüde çağrılır. TRADE_ANALIZ_INTERVAL_MIN dakikada bir piyasa analizi yapar
+    ve uygun koşullarda otomatik emir açar.
+    """
+    global son_trade_analiz_zamani, ai_firsat_yok_serisi, son_xau_bid
+    if not OTONOM_TRADE_AKTIF:
+        return
+    if not MT5_CONNECTED:
+        return
+    simdi = time.time()
+    if simdi - son_trade_analiz_zamani < TRADE_ANALIZ_INTERVAL_MIN * 60:
+        return
+
+    hesap = mt5_hesap_ozeti() or mt5_dosya_hesap_ozeti()
+    if not hesap or hesap.get("balance", 0) <= 0:
+        logger.info("💰 Hesap bilgisi okunamadı, otonom trade atlanıyor.")
+        return
+
+    gunluk_durum = gunluk_durum_yukle()
+    if not gunluk_durum.get("baslangic_bakiye"):
+        gunluk_durum["baslangic_bakiye"] = hesap["balance"]
+        gunluk_durum_kaydet(gunluk_durum)
+
+    queue_data = trade_queue_yukle()
+    aktif = aktif_order_sayisi(queue_data)
+    baslangic = gunluk_durum.get("baslangic_bakiye") or hesap.get("balance", 0)
+    gunluk_kayip_pct = max(0.0, ((baslangic - hesap.get("equity", 0)) / baslangic) * 100) if baslangic > 0 else 0.0
+
+    kararlar = otonom_trade_karari(hesap, gunluk_durum)
+    son_trade_analiz_zamani = simdi
+
+    if kararlar:
+        ai_firsat_yok_serisi = 0
+    else:
+        ai_firsat_yok_serisi += 1
+
+    if not kararlar and ai_firsat_yok_serisi >= 3 and aktif == 0 and gunluk_kayip_pct < (DAILY_MAX_LOSS_PCT * 0.5):
+        sym = sembol_bilgisi_al("XAUUSD")
+        if sym and sym.get("bid", 0) > 0 and sym.get("ask", 0) > 0:
+            bid = sym.get("bid", 0)
+            ask = sym.get("ask", 0)
+            tick_size = sym.get("tick_size", 0.01) or 0.01
+            spread_price = (sym.get("spread", 0) or 0) * tick_size
+            if son_xau_bid is None:
+                son_xau_bid = bid
+            side = "buy" if bid >= son_xau_bid else "sell"
+            son_xau_bid = bid
+            sl_dist = max(3.0, round(spread_price * 15, 2))
+            tp_dist = round(sl_dist * 1.8, 2)
+            kararlar = [{
+                "symbol": "XAUUSD",
+                "side": side,
+                "sl_price_dist": sl_dist,
+                "tp_price_dist": tp_dist,
+                "neden": "ai_no_signal_fallback_momentum",
+            }]
+            ai_firsat_yok_serisi = 0
+            logger.info(
+                f"🤖 Fallback pilot işlem üretildi: XAUUSD {side} sl_dist={sl_dist} tp_dist={tp_dist}"
+            )
+
+    for karar in kararlar:
+        symbol = str(karar.get("symbol", "")).upper().strip()
+        side = str(karar.get("side", "")).lower().strip()
+        sl_price_dist = float(karar.get("sl_price_dist") or 0)
+        tp_price_dist = float(karar.get("tp_price_dist") or 0)
+        neden = str(karar.get("neden", ""))[:100]
+
+        if not symbol or side not in {"buy", "sell"} or sl_price_dist <= 0 or tp_price_dist <= 0:
+            logger.warning(f"⚠️ Geçersiz AI kararı atlandı: {karar}")
+            continue
+
+        # Sembol bilgisini EA'dan iste — spread, lot limitleri, güncel fiyat
+        sym_info = sembol_bilgisi_al(symbol)
+        if not sym_info:
+            logger.warning(f"⚠️ {symbol} sembol bilgisi alınamadı, işlem açılmıyor.")
+            continue
+
+        bid = sym_info.get("bid", 0)
+        ask = sym_info.get("ask", 0)
+        spread_pts = sym_info.get("spread", 0)
+        tick_value = sym_info.get("tick_value", 0)
+        tick_size = sym_info.get("tick_size", 0.00001)
+        min_lot = sym_info.get("min_lot", 0.01)
+        max_lot = sym_info.get("max_lot", 100)
+        lot_step = sym_info.get("lot_step", 0.01)
+        digits = sym_info.get("digits", 5)
+
+        if bid <= 0 or ask <= 0:
+            logger.warning(f"⚠️ {symbol} fiyat yok (bid={bid} ask={ask}), açılmıyor.")
+            continue
+
+        # Spread kontrolü: spread, SL mesafesinin %25'inden büyükse aç
+        spread_price = spread_pts * tick_size
+        if spread_price > sl_price_dist * 0.25:
+            logger.warning(
+                f"⚠️ {symbol} spread çok yüksek ({spread_price:.5f} > SL'nin %%25'i), işlem açılmıyor."
+            )
+            continue
+
+        # Risk bazlı lot hesapla
+        lot = lot_hesapla(
+            hesap["balance"], MAX_RISK_PER_TRADE_PCT, sl_price_dist,
+            tick_value, tick_size, lot_step, min_lot, max_lot,
+        )
+
+        entry = ask if side == "buy" else bid
+        if side == "buy":
+            sl = round(entry - sl_price_dist, digits)
+            tp = round(entry + tp_price_dist, digits)
+        else:
+            sl = round(entry + sl_price_dist, digits)
+            tp = round(entry - tp_price_dist, digits)
+
+        order = {"symbol": symbol, "side": side, "lot": lot, "sl": sl, "tp": tp}
+        kayit, hata = trade_emri_ekle(order, source=f"ai_auto:{neden[:40]}")
+        if hata:
+            logger.warning(f"❌ AI emri reddedildi ({symbol}): {hata}")
+        else:
+            logger.info(
+                f"🤖 AI işlem: #{kayit['id']} {symbol} {side} lot={lot:.4f} "
+                f"sl={sl} tp={tp} | {neden}"
+            )
+            gunluk_durum["acilan_islem_sayisi"] = gunluk_durum.get("acilan_islem_sayisi", 0) + 1
+            gunluk_durum_kaydet(gunluk_durum)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+
+
 def tek_dongu_calistir():
+    global son_trade_analiz_zamani
+    test_ara_aktif = os.path.exists(TEST_TEK_SEFER_MOLTBOOK_ARA_DOSYASI)
+
+    if test_ara_aktif:
+        try:
+            os.remove(TEST_TEK_SEFER_MOLTBOOK_ARA_DOSYASI)
+        except Exception as e:
+            logger.warning(f"TEST flag dosyası tüketilemedi: {e}")
+        logger.info("🧪 TEST: Moltbook bu tur erken ara modunda, trade analizi öne alınıyor.")
+        son_trade_analiz_zamani = 0.0
+
+    otonom_trade_dongusu()
+    trade_emir_yurutucu()
+
     if ARASTIRMA_MODU:
-        zamanli_rapor_kontrolu_ve_gonderimi()
-        diger_postlari_tara_ve_etkiles()
-    paylas_ve_takil()
+        if test_ara_aktif:
+            logger.info("🧪 TEST: Bu tur Moltbook etkileşimleri pas geçildi.")
+        else:
+            haftalik_saglik_raporu_kontrolu_ve_gonderimi()
+            zamanli_rapor_kontrolu_ve_gonderimi()
+            trade_denemesi_tecrubesi_paylas()
+            kapali_islem_ozet_paylas()
+            diger_postlari_tara_ve_etkiles()
+    if not test_ara_aktif:
+        paylas_ve_takil()
 
 
 def ajanla_konus():

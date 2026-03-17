@@ -7,7 +7,14 @@ launchd.err.log
 launchd.out.log
 agent.lock
 gunluk_rapor.txt
+haftalik_saglik_raporu.txt
 rapor_arsiv/
 learned_memory.json
 post_history.json
 report_state.json
+trade_journal.json
+trade_order_queue.json
+gunluk_trade_durum.json
+ovrthnk_orders_outbox.csv
+ovrthnk_orders_result.csv
+ovrthnk_processed_ids.txt
