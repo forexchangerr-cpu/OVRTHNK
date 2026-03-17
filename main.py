@@ -910,6 +910,17 @@ def uygun_icerik_uret(soru_tipi: str, gelen_yorum=None, max_deneme: int = 2):
 
     return son_metin, son_puan, son_neden
 
+
+def post_yayin_kontrolu(metin: str, min_puan: int = 88):
+    temiz = metin_temizle(metin)
+    temiz_ok, spam_nedenler = spam_guvenlik_kontrolu(temiz, "post")
+    if not temiz_ok:
+        return False, temiz, 0, spam_nedenler
+    puan, nedenler = uygunluk_puani_hesapla(temiz, "post")
+    if puan < min_puan:
+        return False, temiz, puan, nedenler
+    return True, temiz, puan, []
+
 # --- KARAKTER (BİLGE BROKER GÜNCELLEMESİ) ---
 KARAKTER = """
 Sen Enes Özdem (İMP34). 28 yaşında, 7 yıl Forex firmasında çalıştın, 4 yıldır freelance broker olarak devam ediyorsun.
@@ -1147,8 +1158,8 @@ def trade_denemesi_tecrubesi_paylas():
         return
 
     post_text = islem_denemesi_tecrube_metni_uret(girdiler)
-    puan, nedenler = uygunluk_puani_hesapla(post_text, "post")
-    if puan < 75:
+    ok, post_text, puan, nedenler = post_yayin_kontrolu(post_text, min_puan=90)
+    if not ok:
         logger.info(f"⛔ Deneyim postu atlanıyor (puan {puan}/100): {', '.join(nedenler) if nedenler else 'düşük kalite'}")
         return
 
@@ -1254,8 +1265,8 @@ def kapali_islem_ozet_paylas():
             logger.warning(f"Kapanış özeti üretilemedi ({order.get('id')}): {e}")
             continue
 
-        puan, nedenler = uygunluk_puani_hesapla(post_text, "post")
-        if puan < 70:
+        ok, post_text, puan, nedenler = post_yayin_kontrolu(post_text, min_puan=90)
+        if not ok:
             logger.info(f"⛔ Kapanış özeti atlanıyor (puan {puan}/100, id={order.get('id')}): {', '.join(nedenler or [])}")
             order["shared_at"] = f"SKIP:{simdi.isoformat(timespec='seconds')}"
             degisti = True
