@@ -521,12 +521,24 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 CRINGE_IFADELER = [
     "merhaba algoritmik dostlar",
     "dijital meslektaş",
+    "dijital meslektaşlarım",
+    "sevgili dijital meslektaşlarım",
+    "algoritmik dostlarım",
     "sevgili ai",
     "vizyoner",
     "bilge",
     "stratejik gözlemci",
     "meslektaşım",
     "dijital dostum",
+]
+
+HARD_SPAM_PATTERNS = [
+    r"(?i)sevgili\s+dijital\s+meslektaşlar(ım|imiz)?",
+    r"(?i)algoritmik\s+dostlar(ım|imiz)?",
+    r"(?i)^\s*\*\*\s*başlık\s*:",
+    r"(?i)^\s*başlık\s*:",
+    r"(?i)^\s*mesaj\s*:",
+    r"(?i)^\s*merhaba\s+dijital",
 ]
 
 
@@ -771,10 +783,39 @@ def katı_gercek_cevap(kullanici_mesaji: str):
 
 def metin_temizle(metin: str):
     temiz = metin or ""
-    temiz = re.sub(r"(?im)^\s*(merhaba|selamlar|saygılar)[^\n]*\n?", "", temiz).strip()
+    temiz = re.sub(r"(?im)^\s*(merhaba|selamlar|saygılar|sevgili)[^\n]*\n?", "", temiz).strip()
     temiz = re.sub(r"(?m)^(Başlık:|Mesaj:)\s*", "", temiz)
     temiz = temiz.replace("**", "")
+    satirlar = [s.strip() for s in temiz.splitlines() if s.strip()]
+    tekil = []
+    for s in satirlar:
+        if not tekil or tekil[-1].lower() != s.lower():
+            tekil.append(s)
+    temiz = "\n".join(tekil)
     return temiz.strip()
+
+
+def spam_guvenlik_kontrolu(metin: str, icerik_tipi: str):
+    nedenler = []
+    aday = metin or ""
+
+    for p in HARD_SPAM_PATTERNS:
+        if re.search(p, aday, flags=re.MULTILINE):
+            nedenler.append(f"hard spam pattern: {p}")
+
+    if "##" in aday:
+        nedenler.append("markdown başlık formatı")
+
+    satirlar = [s.strip().lower() for s in aday.splitlines() if s.strip()]
+    if len(satirlar) >= 2 and satirlar[0] == satirlar[1]:
+        nedenler.append("tekrarlı açılış satırı")
+
+    if icerik_tipi == "post":
+        kelime_sayisi = len(re.findall(r"\w+", aday, flags=re.UNICODE))
+        if kelime_sayisi > 180:
+            nedenler.append("post gereksiz uzun")
+
+    return (len(nedenler) == 0), nedenler
 
 
 def yorum_uzunlugu_profili(gelen_yorum: str):
@@ -835,9 +876,14 @@ def uygun_icerik_uret(soru_tipi: str, gelen_yorum=None, max_deneme: int = 2):
     son_neden = []
     icerik_tipi = "yorum" if soru_tipi == "Yorumu Cevapla" else "post"
 
-    for _ in range(max_deneme):
+    deneme_sayisi = 4 if soru_tipi == "Yeni Post Oluştur" else max_deneme
+    for _ in range(deneme_sayisi):
         aday = ajana_sor(soru_tipi, gelen_yorum=gelen_yorum)
         aday = metin_temizle(aday)
+        temiz_ok, spam_nedenler = spam_guvenlik_kontrolu(aday, icerik_tipi)
+        if not temiz_ok:
+            son_metin, son_puan, son_neden = aday, 0, spam_nedenler
+            continue
         puan, nedenler = uygunluk_puani_hesapla(aday, icerik_tipi)
         son_metin, son_puan, son_neden = aday, puan, nedenler
         if puan >= 75:
@@ -911,7 +957,8 @@ def ajana_sor(soru_tipi, gelen_yorum=None):
         prompt += (
             "\n\nFinans/piyasalar/teknoloji üzerine kısa, sade, doğal bir post yaz. "
             "Selamlama cümlesi YAZMA, direkt konuya gir. Hype veya pazarlama dili kullanma. "
-            "Aşırı iddialı slogan, teatral ifade ve kendini öven ton kullanma."
+            "Aşırı iddialı slogan, teatral ifade ve kendini öven ton kullanma. "
+            "ASLA şu ifadeleri kullanma: 'dijital meslektaşlarım', 'algoritmik dostlarım', 'Başlık:', 'Mesaj:'."
         )
 
     if soru_tipi == "Sohbet Et":
@@ -1440,7 +1487,7 @@ def paylas_ve_takil():
 
     logger.info("🕒 Post zamanı geldi, içerik hazırlanıyor...")
     yeni_post, puan, nedenler = uygun_icerik_uret("Yeni Post Oluştur")
-    if puan < 78:
+    if puan < 88:
         logger.info(f"⛔ Post atlanıyor (uygunluk puanı {puan}/100): {', '.join(nedenler) if nedenler else 'düşük kalite'}")
         return
     title = yeni_post.strip().split("\n")[0][:80] or "Piyasa Notu"
