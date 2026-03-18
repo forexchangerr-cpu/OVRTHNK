@@ -317,8 +317,52 @@ def trade_queue_kaydet(queue_data):
     save_json(TRADE_QUEUE_FILE, queue_data)
 
 
+def mt5_acik_pozisyon_sayisi() -> int:
+    """MT5 account_state.csv'den gerçek açık pozisyon sayısını oku.
+    EA güncel sürüm gerektirir (open_positions sütunu).
+    Veri yoksa veya sütun eksikse -1 döner.
+    """
+    state_path = mt5_account_state_file()
+    if not os.path.exists(state_path):
+        return -1
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if rows:
+            val = rows[-1].get("open_positions")
+            if val is not None:
+                return int(float(val))
+    except Exception:
+        pass
+    return -1
+
+
 def aktif_order_sayisi(queue_data):
-    return len([o for o in queue_data.get("orders", []) if o.get("status") in {"approved", "queued", "sent", "open"}])
+    """Kaç adet aktif/bekleyen trade pozisyonu var?
+    Önce MT5'ten gerçek açık pozisyon sayısını okur (EA'nın yazdığı).
+    MT5 verisi yoksa fallback: queue'daki sent/filled emirleri say.
+    """
+    mt5_count = mt5_acik_pozisyon_sayisi()
+    if mt5_count >= 0:
+        # MT5'ten gelen gerçek açık pozisyon sayısı +
+        # henüz MT5'e gönderilmemiş onaylı emirler (approved/queued)
+        pending = len([
+            o for o in queue_data.get("orders", [])
+            if o.get("status") in {"approved", "queued"}
+        ])
+        return mt5_count + pending
+
+    # Fallback (EA eski sürüm): bugün açılan filled emirleri de say,
+    # yoksa her doldurmada limit sıfırlanır ve sonsuz kademeli işlem açılır.
+    today = datetime.now().strftime("%Y-%m-%d")
+    count = 0
+    for o in queue_data.get("orders", []):
+        st = o.get("status", "")
+        if st in {"approved", "queued", "sent", "open"}:
+            count += 1
+        elif st == "filled" and (o.get("created_at") or "")[:10] == today:
+            count += 1
+    return count
 
 
 def trade_komutu_parse_et(mesaj: str):
@@ -2062,11 +2106,13 @@ def mt5_dosya_hesap_ozeti() -> dict | None:
             rows = list(csv.DictReader(f))
         if rows:
             r = rows[-1]
+            open_pos_raw = r.get("open_positions")
             return {
                 "balance": float(r.get("balance") or 0),
                 "equity": float(r.get("equity") or 0),
                 "profit": float(r.get("profit") or 0),
                 "margin_free": float(r.get("margin_free") or 0),
+                "open_positions": int(float(open_pos_raw)) if open_pos_raw is not None else None,
             }
     except Exception as e:
         logger.warning(f"Hesap durum dosyası okunamadı: {e}")

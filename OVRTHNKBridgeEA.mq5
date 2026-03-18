@@ -177,12 +177,13 @@ void WriteAccountState()
 {
    int f = FileOpen(ACCOUNT_STATE_FILE, FILE_CSV|FILE_WRITE|FILE_COMMON|FILE_ANSI, ',');
    if(f == INVALID_HANDLE) return;
-   FileWrite(f, "balance", "equity", "profit", "margin_free", "updated_at");
+   FileWrite(f, "balance", "equity", "profit", "margin_free", "open_positions", "updated_at");
    FileWrite(f,
       DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
       DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
       DoubleToString(AccountInfoDouble(ACCOUNT_PROFIT), 2),
       DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2),
+      IntegerToString(PositionsTotal()),
       TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS)
    );
    FileClose(f);
