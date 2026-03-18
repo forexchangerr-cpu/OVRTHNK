@@ -560,6 +560,19 @@ HARD_SPAM_PATTERNS = [
     r"(?i)^\s*merhaba\s+dijital",
 ]
 
+IDENTITY_SAFE_NAME = "Arda V"
+IDENTITY_BANNED_PATTERNS = [
+    r"(?i)\benes\s+özdem\b",
+    r"(?i)\benes\s+ozdem\b",
+]
+
+
+def kimlik_maskele(metin: str):
+    temiz = metin or ""
+    for pattern in IDENTITY_BANNED_PATTERNS:
+        temiz = re.sub(pattern, IDENTITY_SAFE_NAME, temiz)
+    return temiz
+
 
 def email_hazir_mi():
     return all([RAPOR_EMAIL_TO, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM])
@@ -802,6 +815,7 @@ def katı_gercek_cevap(kullanici_mesaji: str):
 
 def metin_temizle(metin: str):
     temiz = metin or ""
+    temiz = kimlik_maskele(temiz)
     temiz = re.sub(r"(?im)^\s*(merhaba|selamlar|saygılar|sevgili)[^\n]*\n?", "", temiz).strip()
     temiz = re.sub(r"(?m)^(Başlık:|Mesaj:)\s*", "", temiz)
     temiz = temiz.replace("**", "")
@@ -817,6 +831,10 @@ def metin_temizle(metin: str):
 def spam_guvenlik_kontrolu(metin: str, icerik_tipi: str):
     nedenler = []
     aday = metin or ""
+
+    for p in IDENTITY_BANNED_PATTERNS:
+        if re.search(p, aday):
+            nedenler.append("yasaklı kimlik ifadesi")
 
     for p in HARD_SPAM_PATTERNS:
         if re.search(p, aday, flags=re.MULTILINE):
@@ -923,7 +941,7 @@ def post_yayin_kontrolu(metin: str, min_puan: int = 88):
 
 # --- KARAKTER (BİLGE BROKER GÜNCELLEMESİ) ---
 KARAKTER = """
-Sen Enes Özdem (İMP34). 28 yaşında, 7 yıl Forex firmasında çalıştın, 4 yıldır freelance broker olarak devam ediyorsun.
+Sen Arda V (İMP34). 28 yaşında, 7 yıl Forex firmasında çalıştın, 4 yıldır freelance broker olarak devam ediyorsun.
 Teknik ve temel analiz yapıyorsun, jeopolitiği takip ediyorsun. Aynı zamanda VR, PlayStation, müzik ekipmanları, emlak ve yapay zeka ilgini çekiyor.
 Moltbook'ta gerçek düşüncelerini paylaşıyorsun — ne bir pazarlamacısın ne de kurumsal bir robot.
 
@@ -1775,6 +1793,45 @@ def gunluk_durum_kaydet(durum: dict):
     save_json(GUNLUK_DURUM_DOSYASI, durum)
 
 
+def piyasa_acik_mi() -> bool:
+    """Forex/CFD piyasasının şu an açık olduğunu kontrol et.
+    Piyasa kabaca Pzt 00:00 UTC – Cum 22:00 UTC arası açıktır.
+    Gece yarısı ve hafta sonu işlem denememek için kullanılır.
+    """
+    now_utc = datetime.utcnow()
+    weekday = now_utc.weekday()   # 0=Pzt ... 6=Paz
+    hour_utc = now_utc.hour
+    minute_utc = now_utc.minute
+    # Pazar günü tüm gün kapalı
+    if weekday == 6:
+        return False
+    # Cumartesi günü tüm gün kapalı
+    if weekday == 5:
+        return False
+    # Cuma 22:00 UTC'den sonra kapalı
+    if weekday == 4 and (hour_utc * 60 + minute_utc) >= 22 * 60:
+        return False
+    # Pazartesi 00:00 UTC'den önce kapalı (çok nadir ama koruma)
+    # Gece 23:00-23:59 UTC arası likidite düşük, işlem yapma
+    if hour_utc == 23:
+        return False
+    return True
+
+
+def bugun_gercek_acilan_islem_sayisi() -> int:
+    """Bugün açılan ve failed/cancelled/rejected OLMAYAN ai_auto emirlerini say.
+    Bu, gece piyasa kapalıyken denemeler sayacı patlatmasını önler.
+    """
+    bugun = datetime.now().strftime("%Y-%m-%d")
+    queue_data = trade_queue_yukle()
+    return len([
+        o for o in queue_data.get("orders", [])
+        if o.get("created_at", "").startswith(bugun)
+        and o.get("source", "").startswith("ai_auto")
+        and o.get("status") not in {"failed", "cancelled", "rejected"}
+    ])
+
+
 def mt5_dosya_hesap_ozeti() -> dict | None:
     """EA'nın yazdığı account_state.csv dosyasından hesap bilgisi oku."""
     state_path = mt5_account_state_file()
@@ -1850,17 +1907,18 @@ def lot_hesapla(balance: float, risk_pct: float, sl_price_dist: float,
 
 def bugunun_piyasa_arastirmasi(konu: str) -> str:
     """Tavily ile YALNIZCA bugünün verilerini ara.
-    Sorguya bugünün tarihini ekleyerek eski verilerin karışmasını engeller.
+    Tavily kota aştıysa veya yoksa GPT'nin kendi bilgisiyle devam edilir.
     """
-    if not tavily:
-        return "Tavily erişimi yok."
     bugun_iso = datetime.now().strftime("%Y-%m-%d")
+    if not tavily:
+        return f"[Tavily yok] GPT kendi bilgisiyle analiz yapacak. Tarih: {bugun_iso}"
     sorgular = [
         f"{konu} today {bugun_iso}",
         f"{konu} fundamental analysis {bugun_iso}",
         f"{konu} market news geopolitical {bugun_iso}",
     ]
     sonuclar = []
+    tavily_hata = False
     for sorgu in sorgular:
         try:
             res = tavily.search(query=sorgu, search_depth="advanced", max_results=3)
@@ -1869,8 +1927,14 @@ def bugunun_piyasa_arastirmasi(konu: str) -> str:
             for r in res.get("results", []):
                 sonuclar.append(f"[{r.get('url', '')}]\n{r.get('content', '')[:400]}")
         except Exception as e:
+            err_str = str(e).lower()
+            if "usage limit" in err_str or "plan" in err_str or "429" in err_str:
+                tavily_hata = True
             logger.warning(f"Tavily hata ({sorgu[:60]}): {e}")
-    return "\n\n".join(sonuclar[:8]) if sonuclar else f"{konu} için güncel veri alınamadı."
+    if not sonuclar:
+        ek = " (Tavily kota aşıldı — GPT dahili bilgisiyle analiz yapılacak)" if tavily_hata else ""
+        return f"{konu} için güncel veri alınamadı{ek}. Tarih: {bugun_iso}"
+    return "\n\n".join(sonuclar[:8])
 
 
 def otonom_trade_karari(hesap: dict, gunluk_durum: dict) -> list:
@@ -1890,7 +1954,7 @@ def otonom_trade_karari(hesap: dict, gunluk_durum: dict) -> list:
         logger.info(f"🛑 Günlük max kayıp ({gunluk_kayip_pct:.1f}% >= {DAILY_MAX_LOSS_PCT}%). Bugün işlem yok.")
         return []
 
-    acilan_islem_sayisi = int(gunluk_durum.get("acilan_islem_sayisi") or 0)
+    acilan_islem_sayisi = bugun_gercek_acilan_islem_sayisi()
     if acilan_islem_sayisi >= MAX_DAILY_TRADES:
         logger.info(f"🛑 Günlük işlem limiti dolu ({acilan_islem_sayisi}/{MAX_DAILY_TRADES}). Yeni işlem açılmıyor.")
         return []
@@ -1919,12 +1983,12 @@ BUGÜNKÜ PİYASA VERİSİ ({bugun}):
 {piyasa_verisi}
 
 ---
-MUTLAK KURAL: Sadece {bugun} tarihine ait verilerle karar ver. Başka tarihlere ait hiçbir veri geçerli değil.
+NOT: Piyasa verisi boşsa veya Tavily erişilemiyorsa — kendi eğitim bilginle {bugun} için en güçlü teknik/temel setup'ı değerlendir. Gerçek veri yokken sadece [] dönme, bilinen trend/seviyelerle analiz yap.
 
 Görev:
-1. Temel analiz — bugünkü makro veriler (FOMC, CPI, istihdam, faiz kararları vb.)
+1. Temel analiz — makro veriler (FOMC, CPI, istihdam, faiz kararları vb.)
 2. Teknik trend — destek/direnç seviyeleri, momentum yönü
-3. Jeopolitik risk — bugünkü gelişmelerin etkisi
+3. Jeopolitik risk — bilinen güncel gelişmelerin etkisi
 4. Spread yüksekse veya sinyal zayıfsa işlem açma
 5. Güçlü fırsat yoksa sadece [] döndür
 6. Fırsat varsa en fazla {MAX_OPEN_TRADES - aktif} işlem öner
@@ -1983,10 +2047,9 @@ PİYASA VERİSİ ({bugun}):
 {piyasa_verisi}
 
 Kural:
-- Sadece bugünün verisi.
+- Piyasa verisi boşsa YINE DE kendi teknik bilginle üret, sadece [] dönme.
 - En fazla 1 işlem öner.
 - Sadece: XAUUSD, EURUSD, GBPUSD, USDJPY.
-- Risk zayıfsa [] döndürme; yalnızca veri tamamen yetersizse [] döndür.
 - RR en az 1:1.5 olsun (tp_price_dist >= 1.5 * sl_price_dist).
 - SL/TP gerçek fiyat mesafesi olarak yaz.
 
@@ -2042,6 +2105,9 @@ def otonom_trade_dongusu():
         return
     if not MT5_CONNECTED:
         return
+    if not piyasa_acik_mi():
+        logger.info("⏸️  Piyasa şu an kapalı (gece/hafta sonu), trade döngüsü bekleniyor.")
+        return
     simdi = time.time()
     if simdi - son_trade_analiz_zamani < TRADE_ANALIZ_INTERVAL_MIN * 60:
         return
@@ -2074,7 +2140,7 @@ def otonom_trade_dongusu():
         and ai_firsat_yok_serisi >= 3
         and aktif == 0
         and gunluk_kayip_pct < (DAILY_MAX_LOSS_PCT * 0.5)
-        and int(gunluk_durum.get("acilan_islem_sayisi") or 0) < MAX_DAILY_TRADES
+        and bugun_gercek_acilan_islem_sayisi() < MAX_DAILY_TRADES
     ):
         sym = sembol_bilgisi_al("XAUUSD")
         if sym and sym.get("bid", 0) > 0 and sym.get("ask", 0) > 0:
@@ -2162,7 +2228,7 @@ def otonom_trade_dongusu():
                 f"🤖 AI işlem: #{kayit['id']} {symbol} {side} lot={lot:.4f} "
                 f"sl={sl} tp={tp} | {neden}"
             )
-            gunluk_durum["acilan_islem_sayisi"] = gunluk_durum.get("acilan_islem_sayisi", 0) + 1
+            # acilan_islem_sayisi artık queue'dan canlı hesaplanıyor (failed emirleri saymaz)
             gunluk_durum_kaydet(gunluk_durum)
 
 
