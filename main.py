@@ -47,6 +47,7 @@ SUBMOLT_NAME = os.getenv("SUBMOLT_NAME", "general")
 POST_INTERVAL_SEC = 21600  # Sabit 6 saat (Kendi postumuz için)
 LOOP_INTERVAL_SEC = 900    # 15 dakika (Yorum ve araştırma turu için)
 REPORT_SLOTS = ["12:00", "18:00", "23:00"]
+POST_SLOTS = ["09:00", "21:00"]
 WEEKLY_HEALTH_DAY = int(os.getenv("WEEKLY_HEALTH_DAY", "0"))  # 0=Pazartesi ... 6=Pazar
 WEEKLY_HEALTH_TIME = os.getenv("WEEKLY_HEALTH_TIME", "21:00")
 TRADE_DENEYIM_PAYLASIM_AKTIF = os.getenv("TRADE_DENEYIM_PAYLASIM_AKTIF", "1").lower() in ("1", "true", "yes")
@@ -105,6 +106,16 @@ MOLTBOOK_COMMENT_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "moltboo
 MOLTBOOK_INSIGHT_MIN_POST = int(os.getenv("MOLTBOOK_INSIGHT_MIN_POST", "50"))
 MOLTBOOK_INSIGHT_MAX_ITEMS = int(os.getenv("MOLTBOOK_INSIGHT_MAX_ITEMS", "400"))
 MAX_COMMENTS_PER_HOUR = int(os.getenv("MAX_COMMENTS_PER_HOUR", "12"))
+MAX_COMMENTS_PER_TUR = int(os.getenv("MAX_COMMENTS_PER_TUR", "1"))
+TRADE_INTELLIGENCE_FILE = os.path.join(os.path.dirname(__file__), "trade_intelligence.json")
+TRADE_INTELLIGENCE_GUNCELLE_INTERVAL_MIN = 30  # her 30 dakikada bir zeka güncelle
+TRADINGVIEW_PROFILE_URL = os.getenv("TRADINGVIEW_PROFILE_URL", "https://tr.tradingview.com/u/Bullex-ARDA-V/").strip()
+TAVILY_DAILY_CALL_LIMIT = int(os.getenv("TAVILY_DAILY_CALL_LIMIT", "25"))
+TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip() or "basic"
+TAVILY_MARKET_CACHE_MIN = int(os.getenv("TAVILY_MARKET_CACHE_MIN", "20"))
+TAVILY_STYLE_CACHE_HOURS = int(os.getenv("TAVILY_STYLE_CACHE_HOURS", "24"))
+TAVILY_CACHE_FILE = os.path.join(os.path.dirname(__file__), "tavily_cache.json")
+TAVILY_STATE_FILE = os.path.join(os.path.dirname(__file__), "tavily_state.json")
 
 # --- YARDIMCI FONKSİYONLAR (MEVCUT) ---
 def safe_request(method, url, max_attempts=3, backoff=2, **kwargs):
@@ -181,13 +192,13 @@ def _to_bool(value, default=False):
 
 
 def stabil_profili_uygula():
-    global SUBMOLT_NAME, POST_INTERVAL_SEC, LOOP_INTERVAL_SEC, REPORT_SLOTS
+    global SUBMOLT_NAME, POST_INTERVAL_SEC, LOOP_INTERVAL_SEC, REPORT_SLOTS, POST_SLOTS
     global WEEKLY_HEALTH_DAY, WEEKLY_HEALTH_TIME
     global MAX_POSTS_PER_DAY, RUN_CONTINUOUS, ARASTIRMA_MODU, POST_PAYLASIM_AKTIF, LOKAL_BILDIRIM_AKTIF
     global TRADE_DENEYIM_PAYLASIM_AKTIF, TRADE_DENEYIM_SLOT, MT5_AKTIF
     global MT5_BRIDGE_AKTIF, MT5_BRIDGE_PYTHON, MT5_FILE_BRIDGE_DIR, LIVE_ORDER_EXECUTION
     global TRADE_EXECUTION_MODE, MAX_RISK_PER_TRADE_PCT, DAILY_MAX_LOSS_PCT, MAX_OPEN_TRADES, MAX_DAILY_TRADES
-    global OTONOM_TRADE_AKTIF, TRADE_ANALIZ_INTERVAL_MIN
+    global OTONOM_TRADE_AKTIF, TRADE_ANALIZ_INTERVAL_MIN, MAX_COMMENTS_PER_HOUR, MAX_COMMENTS_PER_TUR
 
     if not STABLE_MODE:
         logger.info("🔓 Stabil mod kapalı (STABLE_MODE=0).")
@@ -206,6 +217,10 @@ def stabil_profili_uygula():
     slotlar = profil.get("REPORT_SLOTS", REPORT_SLOTS)
     if isinstance(slotlar, list) and slotlar:
         REPORT_SLOTS = [str(s).strip() for s in slotlar if str(s).strip()]
+
+    post_slotlar = profil.get("POST_SLOTS", POST_SLOTS)
+    if isinstance(post_slotlar, list) and post_slotlar:
+        POST_SLOTS = [str(s).strip() for s in post_slotlar if str(s).strip()]
 
     WEEKLY_HEALTH_DAY = int(profil.get("WEEKLY_HEALTH_DAY", WEEKLY_HEALTH_DAY))
     WEEKLY_HEALTH_TIME = str(profil.get("WEEKLY_HEALTH_TIME", WEEKLY_HEALTH_TIME)).strip() or WEEKLY_HEALTH_TIME
@@ -226,6 +241,8 @@ def stabil_profili_uygula():
     MAX_DAILY_TRADES = int(profil.get("MAX_DAILY_TRADES", MAX_DAILY_TRADES))
     OTONOM_TRADE_AKTIF = _to_bool(profil.get("OTONOM_TRADE_AKTIF", OTONOM_TRADE_AKTIF), OTONOM_TRADE_AKTIF)
     TRADE_ANALIZ_INTERVAL_MIN = int(profil.get("TRADE_ANALIZ_INTERVAL_MIN", TRADE_ANALIZ_INTERVAL_MIN))
+    MAX_COMMENTS_PER_HOUR = int(profil.get("MAX_COMMENTS_PER_HOUR", MAX_COMMENTS_PER_HOUR))
+    MAX_COMMENTS_PER_TUR = int(profil.get("MAX_COMMENTS_PER_TUR", MAX_COMMENTS_PER_TUR))
 
     RUN_CONTINUOUS = _to_bool(profil.get("RUN_CONTINUOUS", RUN_CONTINUOUS), RUN_CONTINUOUS)
     ARASTIRMA_MODU = _to_bool(profil.get("ARASTIRMA_MODU", ARASTIRMA_MODU), ARASTIRMA_MODU)
@@ -234,7 +251,7 @@ def stabil_profili_uygula():
 
     logger.info(
         f"🔒 Stabil profil aktif: slotlar={REPORT_SLOTS}, loop={LOOP_INTERVAL_SEC // 60}dk, "
-        f"post_interval={POST_INTERVAL_SEC // 3600}saat, max_post={MAX_POSTS_PER_DAY}"
+        f"post_slots={POST_SLOTS}, max_post={MAX_POSTS_PER_DAY}, yorum/saat={MAX_COMMENTS_PER_HOUR}, yorum/tur={MAX_COMMENTS_PER_TUR}"
     )
 
 LEARNED_MEMORY = load_json(MEMORY_FILE, {})
@@ -242,12 +259,16 @@ POST_HISTORY = load_json(HISTORY_FILE, [])
 RAPOR_DURUMU = load_json(RAPOR_DURUM_DOSYASI, {"sent_slots": []})
 MOLTBOOK_INSIGHTS = load_json(MOLTBOOK_INSIGHT_FILE, {"seen_post_ids": [], "items": []})
 MOLTBOOK_COMMENT_HISTORY = load_json(MOLTBOOK_COMMENT_HISTORY_FILE, {"commented_post_ids": []})
+TAVILY_CACHE = load_json(TAVILY_CACHE_FILE, {})
+TAVILY_STATE = load_json(TAVILY_STATE_FILE, {"date": "", "count": 0})
 stabil_profili_uygula()
 
 if "weekly_slots" not in RAPOR_DURUMU:
     RAPOR_DURUMU["weekly_slots"] = []
 if "trade_experience_slots" not in RAPOR_DURUMU:
     RAPOR_DURUMU["trade_experience_slots"] = []
+if "post_slots" not in RAPOR_DURUMU:
+    RAPOR_DURUMU["post_slots"] = []
 
 if not isinstance(MOLTBOOK_INSIGHTS.get("seen_post_ids"), list):
     MOLTBOOK_INSIGHTS["seen_post_ids"] = []
@@ -259,12 +280,22 @@ if not isinstance(MOLTBOOK_COMMENT_HISTORY.get("comment_timestamps"), list):
     MOLTBOOK_COMMENT_HISTORY["comment_timestamps"] = []
 if not isinstance(MOLTBOOK_COMMENT_HISTORY.get("pause_until_ts"), (int, float)):
     MOLTBOOK_COMMENT_HISTORY["pause_until_ts"] = 0
+if not isinstance(TAVILY_CACHE, dict):
+    TAVILY_CACHE = {}
+if not isinstance(TAVILY_STATE, dict):
+    TAVILY_STATE = {"date": "", "count": 0}
+if not isinstance(TAVILY_STATE.get("count"), int):
+    TAVILY_STATE["count"] = 0
+if not isinstance(TAVILY_STATE.get("date"), str):
+    TAVILY_STATE["date"] = ""
 
 MT5_CONNECTED = False
 MT5_BACKEND = "none"
 son_trade_analiz_zamani = 0.0
+son_zeka_guncelleme_zamani = 0.0
 ai_firsat_yok_serisi = 0
 son_xau_bid = None
+son_fallback_bidler = {}
 
 
 def mt5_outbox_file():
@@ -534,6 +565,66 @@ def can_post():
     save_json(HISTORY_FILE, POST_HISTORY)
     return len(POST_HISTORY) < MAX_POSTS_PER_DAY
 
+
+def tavily_butce_bakimi():
+    bugun = datetime.now().strftime("%Y-%m-%d")
+    if TAVILY_STATE.get("date") != bugun:
+        TAVILY_STATE["date"] = bugun
+        TAVILY_STATE["count"] = 0
+        save_json(TAVILY_STATE_FILE, TAVILY_STATE)
+
+
+def tavily_cagri_izni_var_mi() -> bool:
+    if not tavily:
+        return False
+    tavily_butce_bakimi()
+    return int(TAVILY_STATE.get("count", 0)) < TAVILY_DAILY_CALL_LIMIT
+
+
+def tavily_cache_get(key: str, ttl_min: int):
+    row = TAVILY_CACHE.get(key)
+    if not isinstance(row, dict):
+        return None
+    ts = float(row.get("ts") or 0)
+    if ts <= 0:
+        return None
+    if (time.time() - ts) > max(60, ttl_min * 60):
+        return None
+    return row.get("data")
+
+
+def tavily_cache_set(key: str, data):
+    TAVILY_CACHE[key] = {"ts": time.time(), "data": data}
+    if len(TAVILY_CACHE) > 300:
+        sirali = sorted(TAVILY_CACHE.items(), key=lambda x: float((x[1] or {}).get("ts") or 0), reverse=True)
+        TAVILY_CACHE.clear()
+        for k, v in sirali[:300]:
+            TAVILY_CACHE[k] = v
+    save_json(TAVILY_CACHE_FILE, TAVILY_CACHE)
+
+
+def tavily_search_ekonomik(query: str, max_results: int = 3, cache_key: str | None = None, ttl_min: int = 20):
+    if not tavily:
+        return None
+    key = cache_key or f"q:{query.strip().lower()}"
+    cached = tavily_cache_get(key, ttl_min)
+    if cached is not None:
+        return cached
+
+    if not tavily_cagri_izni_var_mi():
+        logger.info(f"⛔ Tavily günlük çağrı limiti dolu ({TAVILY_STATE.get('count', 0)}/{TAVILY_DAILY_CALL_LIMIT}).")
+        return None
+
+    try:
+        res = tavily.search(query=query, search_depth=TAVILY_SEARCH_DEPTH, max_results=max_results)
+        TAVILY_STATE["count"] = int(TAVILY_STATE.get("count", 0)) + 1
+        save_json(TAVILY_STATE_FILE, TAVILY_STATE)
+        tavily_cache_set(key, res)
+        return res
+    except Exception as e:
+        logger.warning(f"Tavily ekonomik arama hatası: {e}")
+        return None
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
@@ -608,6 +699,29 @@ def rapor_slotu_bul(now: datetime):
     return slotlar[-1]
 
 
+def post_slotu_bul(now: datetime):
+    anlik_dk = now.hour * 60 + now.minute
+    slotlar = []
+    for slot in POST_SLOTS:
+        saat, dakika = slot.split(":")
+        slot_dk = int(saat) * 60 + int(dakika)
+        if anlik_dk >= slot_dk:
+            slotlar.append(slot)
+    if not slotlar:
+        return None
+    return slotlar[-1]
+
+
+def sonraki_post_saati(now: datetime):
+    bugun_dk = now.hour * 60 + now.minute
+    for slot in POST_SLOTS:
+        saat, dakika = slot.split(":")
+        slot_dk = int(saat) * 60 + int(dakika)
+        if slot_dk > bugun_dk:
+            return f"bugün {slot}"
+    return f"yarın {POST_SLOTS[0]}"
+
+
 def sonraki_rapor_saati(now: datetime):
     bugun_dk = now.hour * 60 + now.minute
     for slot in REPORT_SLOTS:
@@ -627,6 +741,7 @@ def sistem_durum_ozeti():
     return (
         f"- Stabil mod: {stabil_durumu}\n"
         f"- Rapor üretimi: AKTİF, saatler {', '.join(REPORT_SLOTS)}\n"
+        f"- Post paylaşım slotları: {', '.join(POST_SLOTS)}\n"
         f"- Haftalık sağlık raporu: {WEEKLY_HEALTH_DAY}. gün {WEEKLY_HEALTH_TIME}\n"
         f"- İşlem deneyimi paylaşımı: {deneyim_durumu}, saat {TRADE_DENEYIM_SLOT}\n"
         f"- MT5 bağlantı modülü: {mt5_durumu} ({MT5_BACKEND})\n"
@@ -969,10 +1084,17 @@ def internette_arastir(sorgu):
     if key in LEARNED_MEMORY: return LEARNED_MEMORY[key]
     logger.info(f"🔍 Ajan internete dalıyor: {sorgu}")
     try:
-        search_result = tavily.search(query=sorgu, search_depth="advanced")
+        search_result = tavily_search_ekonomik(
+            query=sorgu,
+            max_results=3,
+            cache_key=f"memory:{key}",
+            ttl_min=180,
+        )
+        if not search_result:
+            return "Arama atlandı (Tavily bütçe/limit/cache politikası)."
         context = ""
-        for res in search_result['results']:
-            context += f"\nKaynak: {res['url']}\nİçerik: {res['content']}\n"
+        for res in search_result.get('results', [])[:5]:
+            context += f"\nKaynak: {res.get('url', '')}\nİçerik: {(res.get('content', '') or '')[:500]}\n"
         LEARNED_MEMORY[key] = context
         save_json(MEMORY_FILE, LEARNED_MEMORY)
         return context
@@ -1153,6 +1275,93 @@ def islem_denemesi_tecrube_metni_uret(girdiler):
     return metin_temizle(yanit)
 
 
+def bugun_trade_kayitlarini_topla(now: datetime):
+    bugun = now.strftime("%Y-%m-%d")
+    queue_data = trade_queue_yukle()
+    orders = queue_data.get("orders", [])
+    gunluk = []
+    for order in orders:
+        zaman = (
+            str(order.get("created_at") or "")
+            or str(order.get("sent_at") or "")
+            or str(order.get("filled_at") or "")
+        )
+        if not zaman.startswith(bugun):
+            continue
+        gunluk.append(order)
+    return gunluk
+
+
+def gunluk_trade_toplam_yorumu_uret(gunluk_orders, now: datetime):
+    if not gunluk_orders:
+        return ""
+
+    durumlar = {"filled": 0, "closed": 0, "sent": 0, "failed": 0, "open": 0, "queued": 0, "approved": 0}
+    yonler = {"buy": 0, "sell": 0}
+    semboller = {}
+
+    for o in gunluk_orders:
+        st = str(o.get("status", "")).lower().strip()
+        side = str(o.get("side", "")).lower().strip()
+        sym = str(o.get("symbol", "")).upper().strip() or "?"
+        if st in durumlar:
+            durumlar[st] += 1
+        if side in yonler:
+            yonler[side] += 1
+        if sym not in semboller:
+            semboller[sym] = 0
+        semboller[sym] += 1
+
+    sembol_satirlari = [f"- {s}: {n}" for s, n in sorted(semboller.items(), key=lambda x: x[1], reverse=True)[:8]]
+    ham = (
+        f"Tarih: {now.strftime('%Y-%m-%d')}\n"
+        f"Toplam işlem kaydı: {len(gunluk_orders)}\n"
+        f"Durumlar: filled={durumlar['filled']}, closed={durumlar['closed']}, sent={durumlar['sent']}, "
+        f"open={durumlar['open']}, failed={durumlar['failed']}, queued={durumlar['queued']}\n"
+        f"Yön dağılımı: buy={yonler['buy']}, sell={yonler['sell']}\n"
+        "Sembol dağılımı:\n"
+        + "\n".join(sembol_satirlari)
+    )
+
+    prompt = (
+        "Aşağıdaki günlük işlem toplamından Moltbook için TEK bir yorum yaz. "
+        "Bu yorum pozisyon-bazlı değil, günün toplu sonucunu anlatmalı. "
+        "Kısa, samimi, dürüst ve teknik olsun. "
+        "Kesin kazanç/garanti iddiası yazma. Selamlama yok. 1-3 kısa paragraf.\n\n"
+        f"{ham}"
+    )
+    yanit = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": KARAKTER},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=500,
+    ).choices[0].message.content
+    return metin_temizle(yanit)
+
+
+def gunluk_trade_yorum_hedef_post_id(headers: dict):
+    url = f"https://www.moltbook.com/api/v1/posts?submolt_name={SUBMOLT_NAME}&limit=30"
+    res = safe_request("get", url, headers=headers)
+    if res.status_code != 200:
+        return None
+    posts = res.json().get("posts", []) or []
+    if not posts:
+        return None
+
+    for post in posts:
+        pid = str(post.get("id") or "").strip()
+        author = ((post.get("author") or {}).get("username") or "").strip().lower()
+        if pid and author == "ovrthnk_agent":
+            return pid
+    for post in posts:
+        pid = str(post.get("id") or "").strip()
+        if pid:
+            return pid
+    return None
+
+
 def trade_denemesi_tecrubesi_paylas():
     if not TRADE_DENEYIM_PAYLASIM_AKTIF:
         return
@@ -1166,35 +1375,39 @@ def trade_denemesi_tecrubesi_paylas():
     if slot_id in slots:
         return
 
-    girdiler = trade_journal_yukle()
-    if not girdiler:
-        logger.info("İşlem günlüğü boş, deneyim paylaşımı atlandı.")
+    gunluk_orders = bugun_trade_kayitlarini_topla(now)
+    if not gunluk_orders:
+        logger.info("Bugün trade kaydı yok, günlük toplu yorum atlandı.")
         return
 
-    if not can_post():
-        logger.info("Günlük post limiti dolu, deneyim paylaşımı atlandı.")
+    yorum_ok, yorum_neden = yorum_yapabilir_mi()
+    if not yorum_ok:
+        logger.info(f"🛑 Günlük trade yorumu atlandı: {yorum_neden}")
         return
 
-    post_text = islem_denemesi_tecrube_metni_uret(girdiler)
-    ok, post_text, puan, nedenler = post_yayin_kontrolu(post_text, min_puan=90)
+    yorum_text = gunluk_trade_toplam_yorumu_uret(gunluk_orders, now)
+    ok, yorum_text, puan, nedenler = post_yayin_kontrolu(yorum_text, min_puan=85)
     if not ok:
-        logger.info(f"⛔ Deneyim postu atlanıyor (puan {puan}/100): {', '.join(nedenler) if nedenler else 'düşük kalite'}")
+        logger.info(f"⛔ Günlük trade yorumu atlanıyor (puan {puan}/100): {', '.join(nedenler) if nedenler else 'düşük kalite'}")
         return
 
-    title = post_text.strip().split("\n")[0][:80] or "İşlem Günü Notları"
-    url = "https://www.moltbook.com/api/v1/posts"
-    headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}", "Content-Type": "application/json"}
-    body = {"submolt_name": SUBMOLT_NAME, "title": title, "content": post_text}
-    res = safe_request("post", url, json=body, headers=headers)
+    headers = {"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
+    hedef_post_id = gunluk_trade_yorum_hedef_post_id(headers)
+    if not hedef_post_id:
+        logger.info("Günlük trade yorumu için hedef post bulunamadı, bu slot atlandı.")
+        return
+
+    comment_url = f"https://www.moltbook.com/api/v1/posts/{hedef_post_id}/comments"
+    res = yorum_gonder_with_retry(comment_url, headers, yorum_text)
 
     if res.status_code in (200, 201):
-        logger.info(f"📌 Deneyim paylaşımı yapıldı: {title}")
-        record_post()
+        logger.info(f"💬 Günlük trade toplu yorumu paylaşıldı: post={hedef_post_id}")
+        yorum_kota_kaydet()
         slots.append(slot_id)
         RAPOR_DURUMU["trade_experience_slots"] = slots[-120:]
         save_json(RAPOR_DURUM_DOSYASI, RAPOR_DURUMU)
     else:
-        logger.warning(f"Deneyim paylaşımı başarısız: {res.status_code} - {res.text[:250]}")
+        logger.warning(f"Günlük trade toplu yorumu başarısız: {res.status_code} - {res.text[:250]}")
 
 
 # --- KAPALI POZİSYON ÖZET PAYLAŞIMI ---
@@ -1677,8 +1890,8 @@ def diger_postlari_tara_ve_etkiles():
                 yorum_cooldown_uygula(retry_after)
                 logger.info(f"🛑 Moltbook yorum cooldown aktif: {retry_after} sn")
                 break
-        if basarili_yorum >= 2:
-            logger.info("🧩 Bu tur yorum kotası doldu (2 yorum).")
+        if basarili_yorum >= MAX_COMMENTS_PER_TUR:
+            logger.info(f"🧩 Bu tur yorum kotası doldu ({MAX_COMMENTS_PER_TUR} yorum).")
             break
         time.sleep(5)
 
@@ -1692,12 +1905,16 @@ def paylas_ve_takil():
     if not POST_PAYLASIM_AKTIF:
         return
 
-    now = time.time()
-    last_post_ts = POST_HISTORY[-1] if POST_HISTORY else 0
-    gecen_sure = now - last_post_ts
-    if gecen_sure < POST_INTERVAL_SEC:
-        kalan_dk = int((POST_INTERVAL_SEC - gecen_sure) // 60)
-        logger.info(f"🛡️ Post uykusu: {kalan_dk} dk kaldı.")
+    now_dt = datetime.now()
+    aktif_slot = post_slotu_bul(now_dt)
+    if not aktif_slot:
+        logger.info(f"🛡️ Post beklemede. Sonraki post slotu: {sonraki_post_saati(now_dt)}")
+        return
+
+    slot_id = f"{now_dt.strftime('%Y-%m-%d')} {aktif_slot}"
+    post_slots = RAPOR_DURUMU.get("post_slots", [])
+    if slot_id in post_slots:
+        logger.info(f"🛡️ Bu post slotu zaten tamamlandı: {slot_id}")
         return
 
     if not can_post():
@@ -1728,6 +1945,9 @@ def paylas_ve_takil():
     if res.status_code in (200, 201):
         logger.info(f"✅ Yeni post atıldı: {title} (puan {puan}/100)")
         record_post()
+        post_slots.append(slot_id)
+        RAPOR_DURUMU["post_slots"] = post_slots[-120:]
+        save_json(RAPOR_DURUM_DOSYASI, RAPOR_DURUMU)
     else:
         logger.warning(f"Post atılamadı: {res.status_code} - {res.text[:300]}")
         if res.status_code == 429:
@@ -1905,6 +2125,265 @@ def lot_hesapla(balance: float, risk_pct: float, sl_price_dist: float,
     return min(max_lot, max(min_lot, lot))
 
 
+def trade_zekasi_yukle() -> dict:
+    varsayilan = {
+        "son_guncelleme": "",
+        "toplam_filled": 0,
+        "sembol_istatistik": {},
+        "yon_istatistik": {"buy": 0, "sell": 0},
+        "son_kararlar": [],
+        "dersler": "",
+        "uyarilar": [],
+        "kullanici_stili": {
+            "profil_url": TRADINGVIEW_PROFILE_URL,
+            "ozet": "",
+            "son_guncelleme": "",
+        },
+    }
+    data = load_json(TRADE_INTELLIGENCE_FILE, varsayilan)
+    if not isinstance(data, dict):
+        return varsayilan
+    for k, v in varsayilan.items():
+        if k not in data:
+            data[k] = v
+    if not isinstance(data.get("sembol_istatistik"), dict):
+        data["sembol_istatistik"] = {}
+    if not isinstance(data.get("yon_istatistik"), dict):
+        data["yon_istatistik"] = {"buy": 0, "sell": 0}
+    if not isinstance(data.get("son_kararlar"), list):
+        data["son_kararlar"] = []
+    if not isinstance(data.get("uyarilar"), list):
+        data["uyarilar"] = []
+    if not isinstance(data.get("kullanici_stili"), dict):
+        data["kullanici_stili"] = varsayilan["kullanici_stili"]
+    return data
+
+
+def tradingview_stil_ozeti_uret() -> str:
+    if not TRADINGVIEW_PROFILE_URL:
+        return ""
+    parcalar = []
+    try:
+        res = requests.get(TRADINGVIEW_PROFILE_URL, timeout=20)
+        if res.status_code == 200:
+            html = res.text or ""
+            title_m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+            desc_m = re.search(
+                r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+                html,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if title_m:
+                parcalar.append(re.sub(r"\s+", " ", title_m.group(1)).strip())
+            if desc_m:
+                parcalar.append(re.sub(r"\s+", " ", desc_m.group(1)).strip())
+    except Exception as e:
+        logger.warning(f"TradingView profil okuma hatası: {e}")
+
+    if tavily:
+        try:
+            q = f"{TRADINGVIEW_PROFILE_URL} tradingview ideas analysis style"
+            tv_res = tavily_search_ekonomik(
+                query=q,
+                max_results=3,
+                cache_key=f"tv_style:{TRADINGVIEW_PROFILE_URL.lower()}",
+                ttl_min=max(60, TAVILY_STYLE_CACHE_HOURS * 60),
+            )
+            if not tv_res:
+                tv_res = {}
+            if tv_res.get("answer"):
+                parcalar.append(tv_res.get("answer", ""))
+            for r in tv_res.get("results", [])[:3]:
+                icerik = (r.get("content") or "").strip()
+                if icerik:
+                    parcalar.append(icerik[:400])
+        except Exception as e:
+            logger.warning(f"TradingView Tavily arama hatası: {e}")
+
+    ham_ozet = "\n".join([p for p in parcalar if p]).strip()
+    if not ham_ozet:
+        return ""
+
+    try:
+        style_prompt = f"""Aşağıdaki metinler bir traderın TradingView profilinden/toplanan içeriklerden geldi.
+Kısa bir "analiz stili özeti" üret:
+- Zamanlama yaklaşımı
+- Teknik/temel odak
+- Risk yönetimi yaklaşımı
+- Çift yönlü piyasa bakışı (buy/sell)
+
+Maksimum 6 kısa madde, Türkçe, sade:
+
+{ham_ozet[:6000]}"""
+        yanit = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Kısa ve somut çıkarım yapan bir trading analiz asistanısın."},
+                {"role": "user", "content": style_prompt},
+            ],
+            max_tokens=500,
+        ).choices[0].message.content.strip()
+        return yanit[:2000]
+    except Exception as e:
+        logger.warning(f"TradingView stil özeti üretilemedi: {e}")
+        return ham_ozet[:1200]
+
+
+def trade_zekasi_guncelle():
+    zeka = trade_zekasi_yukle()
+    queue_data = trade_queue_yukle()
+    orders = queue_data.get("orders", [])
+    if not isinstance(orders, list):
+        orders = []
+
+    filled = [o for o in orders if o.get("status") == "filled"]
+    sembol_istatistik = {}
+    yon_buy = 0
+    yon_sell = 0
+
+    for o in filled:
+        sym = str(o.get("symbol", "")).upper().strip()
+        side = str(o.get("side", "")).lower().strip()
+        if not sym:
+            continue
+        if sym not in sembol_istatistik:
+            sembol_istatistik[sym] = {"filled": 0, "buy": 0, "sell": 0}
+        sembol_istatistik[sym]["filled"] += 1
+        if side in {"buy", "sell"}:
+            sembol_istatistik[sym][side] += 1
+            if side == "buy":
+                yon_buy += 1
+            else:
+                yon_sell += 1
+
+    son_kararlar = []
+    for o in orders[-30:]:
+        son_kararlar.append({
+            "tarih": o.get("created_at") or o.get("updated_at") or "",
+            "symbol": str(o.get("symbol", "")).upper().strip(),
+            "side": str(o.get("side", "")).lower().strip(),
+            "neden": str(o.get("source", ""))[:80],
+            "sonuc": str(o.get("status", "")),
+        })
+
+    tv_ozet = tradingview_stil_ozeti_uret()
+    if tv_ozet:
+        zeka["kullanici_stili"] = {
+            "profil_url": TRADINGVIEW_PROFILE_URL,
+            "ozet": tv_ozet,
+            "son_guncelleme": datetime.now().isoformat(),
+        }
+
+    zeka["son_guncelleme"] = datetime.now().isoformat()
+    zeka["toplam_filled"] = len(filled)
+    zeka["sembol_istatistik"] = sembol_istatistik
+    zeka["yon_istatistik"] = {"buy": yon_buy, "sell": yon_sell}
+    zeka["son_kararlar"] = son_kararlar[-20:]
+
+    buy_sell_mesaji = (
+        f"Buy/Sell dağılımı: buy={yon_buy}, sell={yon_sell}. "
+        "Forex çift yönlüdür; sadece buy odaklı kalma."
+    )
+    sembol_mesaji = ""
+    if sembol_istatistik:
+        en_cok = sorted(sembol_istatistik.items(), key=lambda x: x[1].get("filled", 0), reverse=True)[0][0]
+        sembol_mesaji = (
+            f"Ağırlık verilen sembol: {en_cok}. "
+            "Tek sembole kilitlenme; fırsata göre EURUSD/GBPUSD/USDJPY/XAUUSD arasında seç."
+        )
+
+    try:
+        ders_prompt = f"""Aşağıdaki trade geçmişinden kısa ders çıkar.
+Hedef:
+1) Tek yön (sadece buy) veya tek sembol (sadece XAUUSD) sapmasını azalt
+2) Çift yönlü piyasa mantığını koru
+3) Kullanıcının TradingView stilinden öğren, ama ona kilitlenme
+
+İstatistik:
+{json.dumps(zeka.get('sembol_istatistik', {}), ensure_ascii=False)}
+Yön:
+{json.dumps(zeka.get('yon_istatistik', {}), ensure_ascii=False)}
+Kullanıcı stili:
+{(zeka.get('kullanici_stili', {}) or {}).get('ozet', '')}
+Önceki dersler:
+{zeka.get('dersler', '')}
+
+Çıktı formatı:
+- 4-6 kısa ders maddesi
+- 2-4 kısa uyarı maddesi"""
+        ders_yanit = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Kısa, uygulanabilir ve risk odaklı trade koçu gibi yaz."},
+                {"role": "user", "content": ders_prompt},
+            ],
+            max_tokens=700,
+        ).choices[0].message.content.strip()
+        zeka["dersler"] = ders_yanit[:2500]
+        zeka["uyarilar"] = [buy_sell_mesaji, sembol_mesaji] if sembol_mesaji else [buy_sell_mesaji]
+    except Exception as e:
+        logger.warning(f"Trade zekası ders üretimi başarısız: {e}")
+        zeka["dersler"] = "\n".join([
+            "- Forex çift yönlüdür: buy kadar sell fırsatları da değerlidir.",
+            "- İlk işlem buy oldu diye sonraki işlemleri aynı yöne sabitleme.",
+            "- XAUUSD güçlü olsa da tek sembole kilitlenmeden fırsat bazlı hareket et.",
+            "- Kullanıcı stilini referans al ama kör kopyalama yapma; piyasa koşuluna adaptif ol.",
+        ])
+        zeka["uyarilar"] = [buy_sell_mesaji, sembol_mesaji] if sembol_mesaji else [buy_sell_mesaji]
+
+    save_json(TRADE_INTELLIGENCE_FILE, zeka)
+    logger.info(
+        f"🧠 Trade zekası güncellendi | filled={zeka.get('toplam_filled', 0)} "
+        f"buy={zeka.get('yon_istatistik', {}).get('buy', 0)} "
+        f"sell={zeka.get('yon_istatistik', {}).get('sell', 0)}"
+    )
+
+
+def trade_zekasi_ozeti() -> str:
+    zeka = trade_zekasi_yukle()
+    st = zeka.get("sembol_istatistik", {}) or {}
+    yon = zeka.get("yon_istatistik", {}) or {}
+    style = (zeka.get("kullanici_stili", {}) or {}).get("ozet", "")
+    dersler = zeka.get("dersler", "")
+    uyarilar = zeka.get("uyarilar", []) or []
+
+    st_satirlari = []
+    for sym, v in sorted(st.items(), key=lambda x: x[1].get("filled", 0), reverse=True)[:6]:
+        st_satirlari.append(
+            f"- {sym}: filled={v.get('filled', 0)} buy={v.get('buy', 0)} sell={v.get('sell', 0)}"
+        )
+    st_metin = "\n".join(st_satirlari) if st_satirlari else "- Henüz sembol istatistiği yok"
+
+    uyarilar_metin = "\n".join([f"- {u}" for u in uyarilar[:5]]) if uyarilar else "-"
+    return (
+        "TRADE ZEKA ÖZETİ:\n"
+        f"Son güncelleme: {zeka.get('son_guncelleme', '-') }\n"
+        f"Toplam filled: {zeka.get('toplam_filled', 0)}\n"
+        f"Yön dağılımı: buy={yon.get('buy', 0)} sell={yon.get('sell', 0)}\n"
+        "Sembol istatistik:\n"
+        f"{st_metin}\n\n"
+        "Kullanıcı TradingView stili özeti:\n"
+        f"{style[:1200] if style else '-'}\n\n"
+        "Dersler:\n"
+        f"{dersler[:1600] if dersler else '-'}\n\n"
+        "Uyarılar:\n"
+        f"{uyarilar_metin}"
+    )
+
+
+def fallback_sembol_ve_yon_sec() -> tuple:
+    zeka = trade_zekasi_yukle()
+    semboller = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"]
+    stats = zeka.get("sembol_istatistik", {}) or {}
+    secilen = sorted(semboller, key=lambda s: (stats.get(s, {}).get("filled", 0), s))[0]
+
+    yon_stats = zeka.get("yon_istatistik", {}) or {}
+    buy_n = int(yon_stats.get("buy", 0) or 0)
+    sell_n = int(yon_stats.get("sell", 0) or 0)
+    taraf = "sell" if buy_n > sell_n else "buy"
+    return secilen, taraf
+
+
 def bugunun_piyasa_arastirmasi(konu: str) -> str:
     """Tavily ile YALNIZCA bugünün verilerini ara.
     Tavily kota aştıysa veya yoksa GPT'nin kendi bilgisiyle devam edilir.
@@ -1912,19 +2391,30 @@ def bugunun_piyasa_arastirmasi(konu: str) -> str:
     bugun_iso = datetime.now().strftime("%Y-%m-%d")
     if not tavily:
         return f"[Tavily yok] GPT kendi bilgisiyle analiz yapacak. Tarih: {bugun_iso}"
+    konu_l = (konu or "").lower()
     sorgular = [
-        f"{konu} today {bugun_iso}",
-        f"{konu} fundamental analysis {bugun_iso}",
-        f"{konu} market news geopolitical {bugun_iso}",
+        f"{bugun_iso} forex majors xauusd central bank cpi fomc nfp impact summary",
     ]
+    if "xau" in konu_l or "gold" in konu_l:
+        sorgular.append(f"{bugun_iso} xauusd gold usd real yields fed outlook")
+    elif "eur" in konu_l or "gbp" in konu_l or "jpy" in konu_l or "forex" in konu_l:
+        sorgular.append(f"{bugun_iso} eurusd gbpusd usdjpy macro catalyst")
+
     sonuclar = []
     tavily_hata = False
-    for sorgu in sorgular:
+    for idx, sorgu in enumerate(sorgular[:2]):
         try:
-            res = tavily.search(query=sorgu, search_depth="advanced", max_results=3)
+            res = tavily_search_ekonomik(
+                query=sorgu,
+                max_results=2,
+                cache_key=f"market:{bugun_iso}:{idx}:{sorgu[:120].lower()}",
+                ttl_min=TAVILY_MARKET_CACHE_MIN,
+            )
+            if not res:
+                continue
             if res.get("answer"):
                 sonuclar.append(f"[Özet] {res['answer']}")
-            for r in res.get("results", []):
+            for r in res.get("results", [])[:2]:
                 sonuclar.append(f"[{r.get('url', '')}]\n{r.get('content', '')[:400]}")
         except Exception as e:
             err_str = str(e).lower()
@@ -1970,6 +2460,7 @@ def otonom_trade_karari(hesap: dict, gunluk_durum: dict) -> list:
         f"günlük kayıp={gunluk_kayip_pct:.1f}% aktif={aktif}/{MAX_OPEN_TRADES}"
     )
     piyasa_verisi = bugunun_piyasa_arastirmasi("forex gold crypto index market")
+    zeka_ozeti = trade_zekasi_ozeti()
 
     karar_prompt = f"""Bugün: {bugun} | Saat: {saat_str} (Türkiye saati, UTC+3)
 Hesap bakiyesi: {bakiye:.2f} USD
@@ -1982,8 +2473,13 @@ Açık işlem: {aktif}/{MAX_OPEN_TRADES}
 BUGÜNKÜ PİYASA VERİSİ ({bugun}):
 {piyasa_verisi}
 
+KULLANICI ANALİZ STİLİ VE BİRİKİMLİ ZEKA:
+{zeka_ozeti}
+
 ---
 NOT: Piyasa verisi boşsa veya Tavily erişilemiyorsa — kendi eğitim bilginle {bugun} için en güçlü teknik/temel setup'ı değerlendir. Gerçek veri yokken sadece [] dönme, bilinen trend/seviyelerle analiz yap.
+KRİTİK: Forex çift yönlüdür. Sadece buy tarafına veya sadece XAUUSD'ye sabitlenme.
+Eğer satış setup'ı daha güçlüyse sell öner. Eğer başka sembolde fırsat güçlüyse onu öner.
 
 Görev:
 1. Temel analiz — makro veriler (FOMC, CPI, istihdam, faiz kararları vb.)
@@ -2046,10 +2542,15 @@ Açık işlem: {aktif}/{MAX_OPEN_TRADES}
 PİYASA VERİSİ ({bugun}):
 {piyasa_verisi}
 
+ZEKA ÖZETİ:
+{zeka_ozeti}
+
 Kural:
 - Piyasa verisi boşsa YINE DE kendi teknik bilginle üret, sadece [] dönme.
 - En fazla 1 işlem öner.
 - Sadece: XAUUSD, EURUSD, GBPUSD, USDJPY.
+- Forex çift yönlüdür; buy/sell arasında fırsata göre seçim yap.
+- İlk işlem geçmişte buy oldu diye aynı yöne kitlenme.
 - RR en az 1:1.5 olsun (tp_price_dist >= 1.5 * sl_price_dist).
 - SL/TP gerçek fiyat mesafesi olarak yaz.
 
@@ -2100,7 +2601,7 @@ def otonom_trade_dongusu():
     """Her döngüde çağrılır. TRADE_ANALIZ_INTERVAL_MIN dakikada bir piyasa analizi yapar
     ve uygun koşullarda otomatik emir açar.
     """
-    global son_trade_analiz_zamani, ai_firsat_yok_serisi, son_xau_bid
+    global son_trade_analiz_zamani, son_zeka_guncelleme_zamani, ai_firsat_yok_serisi, son_xau_bid, son_fallback_bidler
     if not OTONOM_TRADE_AKTIF:
         return
     if not MT5_CONNECTED:
@@ -2127,6 +2628,9 @@ def otonom_trade_dongusu():
     baslangic = gunluk_durum.get("baslangic_bakiye") or hesap.get("balance", 0)
     gunluk_kayip_pct = max(0.0, ((baslangic - hesap.get("equity", 0)) / baslangic) * 100) if baslangic > 0 else 0.0
 
+    if simdi - son_zeka_guncelleme_zamani >= TRADE_INTELLIGENCE_GUNCELLE_INTERVAL_MIN * 60:
+        trade_zekasi_guncelle()
+        son_zeka_guncelleme_zamani = simdi
     kararlar = otonom_trade_karari(hesap, gunluk_durum)
     son_trade_analiz_zamani = simdi
 
@@ -2137,33 +2641,38 @@ def otonom_trade_dongusu():
 
     if (
         not kararlar
-        and ai_firsat_yok_serisi >= 3
+        and ai_firsat_yok_serisi >= 1
         and aktif == 0
         and gunluk_kayip_pct < (DAILY_MAX_LOSS_PCT * 0.5)
         and bugun_gercek_acilan_islem_sayisi() < MAX_DAILY_TRADES
     ):
-        sym = sembol_bilgisi_al("XAUUSD")
+        fallback_symbol, default_side = fallback_sembol_ve_yon_sec()
+        sym = sembol_bilgisi_al(fallback_symbol)
         if sym and sym.get("bid", 0) > 0 and sym.get("ask", 0) > 0:
             bid = sym.get("bid", 0)
             ask = sym.get("ask", 0)
             tick_size = sym.get("tick_size", 0.01) or 0.01
             spread_price = (sym.get("spread", 0) or 0) * tick_size
-            if son_xau_bid is None:
+            onceki_bid = son_fallback_bidler.get(fallback_symbol)
+            if onceki_bid is None:
+                side = default_side
+            else:
+                side = "buy" if bid >= onceki_bid else "sell"
+            son_fallback_bidler[fallback_symbol] = bid
+            if fallback_symbol == "XAUUSD":
                 son_xau_bid = bid
-            side = "buy" if bid >= son_xau_bid else "sell"
-            son_xau_bid = bid
             sl_dist = max(3.0, round(spread_price * 15, 2))
             tp_dist = round(sl_dist * 1.8, 2)
             kararlar = [{
-                "symbol": "XAUUSD",
+                "symbol": fallback_symbol,
                 "side": side,
                 "sl_price_dist": sl_dist,
                 "tp_price_dist": tp_dist,
-                "neden": "ai_no_signal_fallback_momentum",
+                "neden": "ai_no_signal_fallback_multi_symbol",
             }]
             ai_firsat_yok_serisi = 0
             logger.info(
-                f"🤖 Fallback pilot işlem üretildi: XAUUSD {side} sl_dist={sl_dist} tp_dist={tp_dist}"
+                f"🤖 Fallback pilot işlem üretildi: {fallback_symbol} {side} sl_dist={sl_dist} tp_dist={tp_dist}"
             )
 
     for karar in kararlar:
@@ -2257,7 +2766,6 @@ def tek_dongu_calistir():
             haftalik_saglik_raporu_kontrolu_ve_gonderimi()
             zamanli_rapor_kontrolu_ve_gonderimi()
             trade_denemesi_tecrubesi_paylas()
-            kapali_islem_ozet_paylas()
             diger_postlari_tara_ve_etkiles()
     if not test_ara_aktif:
         paylas_ve_takil()
